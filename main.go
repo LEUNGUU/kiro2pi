@@ -1587,6 +1587,28 @@ func startServer(port string) {
 		handleNonStreamRequest(w, anthropicReq, token.AccessToken)
 	}))
 
+	// 添加 /v1/models 端点
+	mux.HandleFunc("/v1/models", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "只支持GET请求", http.StatusMethodNotAllowed)
+			return
+		}
+		models := []map[string]string{
+			{"id": "claude-sonnet-4.5", "type": "model", "display_name": "Claude Sonnet 4.5", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "claude-sonnet-4", "type": "model", "display_name": "Claude Sonnet 4", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "claude-haiku-4.5", "type": "model", "display_name": "Claude Haiku 4.5", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "claude-opus-4.5", "type": "model", "display_name": "Claude Opus 4.5", "created_at": "2025-01-01T00:00:00Z"},
+		}
+		resp := map[string]any{
+			"data":     models,
+			"has_more": false,
+			"first_id": "claude-sonnet-4.5",
+			"last_id":  "claude-opus-4.5",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+
 	// 添加健康检查端点
 	mux.HandleFunc("/health", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1603,6 +1625,7 @@ func startServer(port string) {
 	fmt.Printf("启动Anthropic API代理服务器，监听端口: %s\n", port)
 	fmt.Printf("可用端点:\n")
 	fmt.Printf("  POST /v1/messages - Anthropic API代理\n")
+	fmt.Printf("  GET  /v1/models   - 获取可用模型列表\n")
 	fmt.Printf("  GET  /health      - 健康检查\n")
 	fmt.Printf("按Ctrl+C停止服务器\n")
 
