@@ -646,6 +646,58 @@ func generateUUID() string {
 }
 
 // buildCodeWhispererRequest 构建 CodeWhisperer 请求 (Q API format matching kiro-cli)
+// estimateInputTokens estimates token count from request using chars/4 heuristic
+func estimateInputTokens(req AnthropicRequest) int {
+	chars := 0
+	for _, sys := range req.System {
+		chars += len(sys.Text)
+	}
+	for _, msg := range req.Messages {
+		chars += countMessageChars(msg.Content)
+	}
+	for _, tool := range req.Tools {
+		chars += len(tool.Name) + len(tool.Description)
+		if schemaBytes, err := json.Marshal(tool.InputSchema); err == nil {
+			chars += len(schemaBytes)
+		}
+	}
+	return (chars + 3) / 4
+}
+
+func countMessageChars(content any) int {
+	switch v := content.(type) {
+	case string:
+		return len(v)
+	case []interface{}:
+		chars := 0
+		for _, block := range v {
+			if m, ok := block.(map[string]interface{}); ok {
+				switch m["type"] {
+				case "text":
+					if text, ok := m["text"].(string); ok {
+						chars += len(text)
+					}
+				case "tool_use":
+					if name, ok := m["name"].(string); ok {
+						chars += len(name)
+					}
+					if input, ok := m["input"]; ok {
+						if inputBytes, err := json.Marshal(input); err == nil {
+							chars += len(inputBytes)
+						}
+					}
+				case "tool_result":
+					if c, ok := m["content"].(string); ok {
+						chars += len(c)
+					}
+				}
+			}
+		}
+		return chars
+	}
+	return 0
+}
+
 func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererRequest {
 	// 使用从kiro-cli读取的profile ARN，如果没有则从环境变量读取
 	profileArn := kiroCliProfileArn
@@ -1760,7 +1812,7 @@ processResponse:
 				"stop_reason":   nil,
 				"stop_sequence": nil,
 				"usage": map[string]any{
-					"input_tokens":  100,
+					"input_tokens":  estimateInputTokens(anthropicReq),
 					"output_tokens": 1,
 				},
 			},
@@ -2114,7 +2166,7 @@ processNonStreamResponse:
 		"stop_sequence": nil,
 		"type":          "message",
 		"usage": map[string]any{
-			"input_tokens":  len(cwReq.ConversationState.CurrentMessage.UserInputMessage.Content),
+			"input_tokens":  estimateInputTokens(anthropicReq),
 			"output_tokens": len(context),
 		},
 	}
