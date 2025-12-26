@@ -647,10 +647,13 @@ func generateUUID() string {
 
 // buildCodeWhispererRequest 构建 CodeWhisperer 请求 (Q API format matching kiro-cli)
 func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererRequest {
-	// 使用从kiro-cli读取的profile ARN，如果没有则使用默认值
+	// 使用从kiro-cli读取的profile ARN，如果没有则从环境变量读取
 	profileArn := kiroCliProfileArn
 	if profileArn == "" {
-		profileArn = "arn:aws:codewhisperer:us-east-1:580100735401:profile/PVMM4YUGEKMY"
+		profileArn = os.Getenv("CODEWHISPERER_PROFILE_ARN")
+	}
+	if profileArn == "" {
+		log.Fatal("Profile ARN not found. Set CODEWHISPERER_PROFILE_ARN environment variable or ensure kiro-cli is configured.")
 	}
 	cwReq := CodeWhispererRequest{
 		ProfileArn: profileArn,
@@ -841,7 +844,50 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 
 				// Include assistant message if it has text OR tool uses
 				if assistantContent != "" || len(toolUses) > 0 {
-					// 如果有pending的用户消息，先添加
+					// Check if we have pending user content AND this assistant has toolUses
+					// This is the abort scenario: user sent new message before providing tool results
+					// We need to: add assistant with toolUses -> add user with cancelled results -> keep pending for currentMessage
+					if len(pendingUserContent) > 0 && len(toolUses) > 0 {
+						// Abort scenario detected: assistant has toolUses but user sent new message without tool_result
+						log.Printf("DEBUG: Abort scenario detected - assistant has toolUses but pending user content exists")
+						
+						// First add the assistant message with toolUses
+						assistantMsg := HistoryAssistantMessage{}
+						assistantMsg.AssistantResponseMessage.MessageId = generateUUID()
+						assistantMsg.AssistantResponseMessage.ToolUses = toolUses
+						assistantMsg.AssistantResponseMessage.Content = assistantContent
+						history = append(history, assistantMsg)
+						
+						// Then add user message with cancelled tool results
+						var cancelledResults []map[string]any
+						for _, toolUse := range toolUses {
+							if tu, ok := toolUse.(map[string]any); ok {
+								if toolUseId, ok := tu["toolUseId"].(string); ok {
+									cancelledResults = append(cancelledResults, map[string]any{
+										"toolUseId": toolUseId,
+										"content":   []map[string]any{{"text": "Tool use was cancelled by the user"}},
+										"status":    "error",
+									})
+								}
+							}
+						}
+						userMsg := HistoryUserMessage{}
+						userMsg.UserInputMessage.Content = ""
+						userMsg.UserInputMessage.Origin = "KIRO_CLI"
+						userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
+							EnvState: &EnvState{
+								OperatingSystem:         runtime.GOOS,
+								CurrentWorkingDirectory: cwd,
+							},
+							ToolResults: cancelledResults,
+						}
+						history = append(history, userMsg)
+						log.Printf("DEBUG: Added assistant with toolUses and user with %d cancelled results, pending content kept for currentMessage", len(cancelledResults))
+						// Keep pendingUserContent - it will go to currentMessage
+						continue
+					}
+					
+					// Normal case: add pending user content first, then assistant
 					if len(pendingUserContent) > 0 {
 						userMsg := HistoryUserMessage{}
 						userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
@@ -876,51 +922,105 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 		// artificial content that the model might mimic. The pending user content
 		// will be part of the current request context instead.
 		if len(pendingUserContent) > 0 {
-			userMsg := HistoryUserMessage{}
-			userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
-			userMsg.UserInputMessage.Origin = "KIRO_CLI"
-			userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
-				EnvState: &EnvState{
-					OperatingSystem:         runtime.GOOS,
-					CurrentWorkingDirectory: cwd,
-				},
-			}
-			history = append(history, userMsg)
-		}
-
-		cwReq.ConversationState.History = history
-
-		// Handle orphaned tool calls: if history ends with assistant toolUses but current message
-		// has no tool_result, generate cancelled tool results (matching kiro-cli behavior)
-		if len(history) > 0 && !hasToolResult(lastMsg.Content) {
-			// Check if last history entry is assistant with toolUses
-			if lastHistoryEntry, ok := history[len(history)-1].(HistoryAssistantMessage); ok {
-				if len(lastHistoryEntry.AssistantResponseMessage.ToolUses) > 0 {
-					log.Printf("DEBUG: Found orphaned tool calls, generating cancelled tool results")
-					var cancelledResults []map[string]any
-					for _, toolUse := range lastHistoryEntry.AssistantResponseMessage.ToolUses {
-						if tu, ok := toolUse.(map[string]any); ok {
-							if toolUseId, ok := tu["toolUseId"].(string); ok {
-								cancelledResult := map[string]any{
-									"toolUseId": toolUseId,
-									"content": []map[string]any{
-										{"text": "Tool use was cancelled by the user"},
-									},
-									"status": "error",
+			// Check if last history entry is assistant with toolUses - need to add cancelled tool results
+			var cancelledResults []map[string]any
+			if len(history) > 0 {
+				if lastAssistant, ok := history[len(history)-1].(HistoryAssistantMessage); ok {
+					if len(lastAssistant.AssistantResponseMessage.ToolUses) > 0 {
+						log.Printf("DEBUG: Found orphaned tool calls in history, generating cancelled tool results")
+						for _, toolUse := range lastAssistant.AssistantResponseMessage.ToolUses {
+							if tu, ok := toolUse.(map[string]any); ok {
+								if toolUseId, ok := tu["toolUseId"].(string); ok {
+									cancelledResult := map[string]any{
+										"toolUseId": toolUseId,
+										"content": []map[string]any{
+											{"text": "Tool use was cancelled by the user"},
+										},
+										"status": "error",
+									}
+									cancelledResults = append(cancelledResults, cancelledResult)
 								}
-								cancelledResults = append(cancelledResults, cancelledResult)
 							}
 						}
-					}
-					if len(cancelledResults) > 0 {
-						// Merge with any existing tool results
-						existingResults := cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.ToolResults
-						cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.ToolResults = append(existingResults, cancelledResults...)
-						log.Printf("DEBUG: Added %d cancelled tool results", len(cancelledResults))
+						log.Printf("DEBUG: Generated %d cancelled tool results", len(cancelledResults))
 					}
 				}
 			}
+
+			userMsg := HistoryUserMessage{}
+			// When we have cancelled tool results, content should be empty and results go in toolResults
+			// The actual user content will be in currentMessage
+			if len(cancelledResults) > 0 {
+				userMsg.UserInputMessage.Content = ""
+				userMsg.UserInputMessage.Origin = "KIRO_CLI"
+				userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
+					EnvState: &EnvState{
+						OperatingSystem:         runtime.GOOS,
+						CurrentWorkingDirectory: cwd,
+					},
+					ToolResults: cancelledResults,
+				}
+				history = append(history, userMsg)
+				// Don't add the pending user content to history - it will be in currentMessage
+				log.Printf("DEBUG: Added user message with cancelled tool results, pending content will be in currentMessage")
+			} else {
+				userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
+				userMsg.UserInputMessage.Origin = "KIRO_CLI"
+				userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
+					EnvState: &EnvState{
+						OperatingSystem:         runtime.GOOS,
+						CurrentWorkingDirectory: cwd,
+					},
+				}
+				history = append(history, userMsg)
+			}
 		}
+
+		// Handle abort scenario: if the LAST message in anthropicReq.Messages is an assistant with toolUses,
+		// it was excluded from the loop (which processes messages 0 to len-2). We need to add it to history
+		// along with cancelled tool results. This happens when user aborts a tool call and sends a new message.
+		if lastMsg.Role == "assistant" {
+			toolUses := extractToolUses(lastMsg.Content)
+			if len(toolUses) > 0 {
+				log.Printf("DEBUG: Last message is assistant with %d toolUses (abort scenario), adding to history with cancelled results", len(toolUses))
+				// Add the assistant message with toolUses to history
+				assistantMsg := HistoryAssistantMessage{}
+				assistantMsg.AssistantResponseMessage.MessageId = generateUUID()
+				assistantMsg.AssistantResponseMessage.Content = getMessageContent(lastMsg.Content)
+				assistantMsg.AssistantResponseMessage.ToolUses = toolUses
+				history = append(history, assistantMsg)
+
+				// Add user message with cancelled tool results
+				var cancelledResults []map[string]any
+				for _, toolUse := range toolUses {
+					if tu, ok := toolUse.(map[string]any); ok {
+						if toolUseId, ok := tu["toolUseId"].(string); ok {
+							cancelledResults = append(cancelledResults, map[string]any{
+								"toolUseId": toolUseId,
+								"content":   []map[string]any{{"text": "Tool use was cancelled by the user"}},
+								"status":    "error",
+							})
+						}
+					}
+				}
+				if len(cancelledResults) > 0 {
+					userMsg := HistoryUserMessage{}
+					userMsg.UserInputMessage.Content = ""
+					userMsg.UserInputMessage.Origin = "KIRO_CLI"
+					userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
+						EnvState: &EnvState{
+							OperatingSystem:         runtime.GOOS,
+							CurrentWorkingDirectory: cwd,
+						},
+						ToolResults: cancelledResults,
+					}
+					history = append(history, userMsg)
+					log.Printf("DEBUG: Added assistant with toolUses and user with %d cancelled results for abort scenario", len(cancelledResults))
+				}
+			}
+		}
+
+		cwReq.ConversationState.History = history
 
 		log.Printf("DEBUG buildCodeWhispererRequest: history length=%d", len(history))
 		for idx, h := range history {

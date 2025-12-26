@@ -169,6 +169,110 @@ func convertAssistantEventToSSE(evt assistantResponseEvent) SSEEvent {
 // thinkingToolIdPrefix is used to identify thinking tool IDs for conversion to thinking blocks
 const thinkingToolIdPrefix = "thinking_"
 
+// thinkingState tracks state for processing thinking tool input
+// Handles JSON envelope stripping and escape sequence unescaping across fragmented events
+type thinkingState struct {
+	envelopeStripped bool   // True once we've found and stripped {"thought": "
+	accumulator      string // Accumulates chars until we find complete opening pattern
+	pendingBackslash bool   // True if previous fragment ended with unprocessed backslash
+}
+
+// Global state for thinking processing per tool ID
+var thinkingStates = make(map[string]*thinkingState)
+
+func getThinkingState(toolId string) *thinkingState {
+	if state, exists := thinkingStates[toolId]; exists {
+		return state
+	}
+	state := &thinkingState{}
+	thinkingStates[toolId] = state
+	return state
+}
+
+func clearThinkingState(toolId string) {
+	delete(thinkingStates, toolId)
+}
+
+// processThinkingInput processes thinking tool input with stateful tracking
+// Handles: 1) JSON envelope stripping {"thought": "..."}, 2) Escape sequence unescaping \n etc.
+// Both can be fragmented across events by Q API
+func processThinkingInput(toolId string, fragment string) string {
+	state := getThinkingState(toolId)
+
+	// Phase 1: Envelope stripping
+	if !state.envelopeStripped {
+		state.accumulator += fragment
+
+		// Look for complete opening pattern
+		openingPatterns := []string{`{"thought": "`, `{"thought":"`}
+		for _, pattern := range openingPatterns {
+			if idx := strings.Index(state.accumulator, pattern); idx != -1 {
+				// Found it - extract content after pattern
+				fragment = state.accumulator[idx+len(pattern):]
+				state.envelopeStripped = true
+				state.accumulator = ""
+				break
+			}
+		}
+
+		if !state.envelopeStripped {
+			// Still accumulating - check if we can rule out ever finding pattern
+			if len(state.accumulator) > 20 {
+				// Something's wrong, pass through as-is
+				fragment = state.accumulator
+				state.accumulator = ""
+				state.envelopeStripped = true
+			} else {
+				// Still waiting for complete pattern
+				return ""
+			}
+		}
+	}
+
+	// Strip closing pattern if present
+	if strings.HasSuffix(fragment, `"}`) {
+		fragment = strings.TrimSuffix(fragment, `"}`)
+	}
+
+	// Phase 2: Escape sequence unescaping with state tracking
+	// Handle backslash from previous fragment
+	if state.pendingBackslash {
+		fragment = `\` + fragment
+		state.pendingBackslash = false
+	}
+
+	// Check for trailing incomplete escape
+	trailingBackslashes := 0
+	for i := len(fragment) - 1; i >= 0; i-- {
+		if fragment[i] == '\\' {
+			trailingBackslashes++
+		} else {
+			break
+		}
+	}
+	if trailingBackslashes > 0 && trailingBackslashes%2 == 1 {
+		state.pendingBackslash = true
+		fragment = fragment[:len(fragment)-1]
+	}
+
+	// Unescape JSON string sequences
+	quoted := `"` + fragment + `"`
+	var unescaped string
+	if err := json.Unmarshal([]byte(quoted), &unescaped); err == nil {
+		return unescaped
+	}
+
+	// Fallback: manual replacement
+	result := fragment
+	result = strings.ReplaceAll(result, `\\`, "\x00BS\x00")
+	result = strings.ReplaceAll(result, `\n`, "\n")
+	result = strings.ReplaceAll(result, `\r`, "\r")
+	result = strings.ReplaceAll(result, `\t`, "\t")
+	result = strings.ReplaceAll(result, `\"`, `"`)
+	result = strings.ReplaceAll(result, "\x00BS\x00", `\`)
+	return result
+}
+
 // convertAssistantEventWithTracking handles events with tool tracking to avoid duplicate content_block_start
 // Also implements content deduplication to prevent duplicate text content
 func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools map[string]bool, toolIndexMap map[string]int, thinkingToolIds map[string]bool, nextToolIndex *int, lastContent *string) []SSEEvent {
@@ -282,7 +386,7 @@ func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools 
 		})
 	} else if evt.Stop {
 		// For stop events, find the correct index
-		toolIndex := 1
+		toolIndex := 1 // Default
 		if evt.ToolUseId != "" {
 			if idx, exists := toolIndexMap[evt.ToolUseId]; exists {
 				toolIndex = idx
@@ -309,7 +413,7 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 	startedTools := make(map[string]bool)
 	toolIndexMap := make(map[string]int)
 	thinkingToolIds := make(map[string]bool)
-	nextToolIndex := 1
+	nextToolIndex := 1 // (0 is reserved for text)
 	lastContent := ""
 
 	// Track thinking input fragments to accumulate full content
@@ -461,24 +565,15 @@ func convertThinkingToolToThinkingBlock(evt assistantResponseEvent, startedTools
 			startedTools[thinkingId] = true
 		}
 
-		// If there's input, extract the thinking content and send as thinking_delta
-		// The input arrives as streaming JSON fragments like:
-		// Fragment 1: {"thought": "
-		// Fragment 2: The user wants...
-		// Fragment N: "}
-		// We need to strip the JSON envelope and just send the content
+		// If there's input, process it with stateful envelope stripping and escape unescaping
+		// The Q API sends {"thought": "content"} but splits it character by character
+		// Both the envelope and escape sequences (\n, etc.) can be fragmented
 		if evt.Input != nil && *evt.Input != "" {
-			input := *evt.Input
+			// Use stateful processing to handle fragmentation
+			content := processThinkingInput(evt.ToolUseId, *evt.Input)
 
-			// Strip JSON envelope parts from the input
-			// Opening patterns: {"thought":" or {"thought": "
-			input = strings.TrimPrefix(input, `{"thought":"`)
-			input = strings.TrimPrefix(input, `{"thought": "`)
-			// Closing pattern: "} (with possible escaped quote before)
-			input = strings.TrimSuffix(input, `"}`)
-
-			// Only send if there's actual content after stripping
-			if input != "" {
+			// Only send if there's actual content after processing
+			if content != "" {
 				events = append(events, SSEEvent{
 					Event: "content_block_delta",
 					Data: map[string]interface{}{
@@ -486,7 +581,7 @@ func convertThinkingToolToThinkingBlock(evt assistantResponseEvent, startedTools
 						"index": thinkingIndex,
 						"delta": map[string]interface{}{
 							"type":     "thinking_delta",
-							"thinking": input,
+							"thinking": content,
 						},
 					},
 				})
@@ -498,6 +593,10 @@ func convertThinkingToolToThinkingBlock(evt assistantResponseEvent, startedTools
 		if idx, exists := toolIndexMap[thinkingId]; exists {
 			thinkingIndex = idx
 		}
+
+		// Clear thinking state for this tool
+		clearThinkingState(evt.ToolUseId)
+
 		events = append(events, SSEEvent{
 			Event: "content_block_stop",
 			Data: map[string]interface{}{
