@@ -1498,15 +1498,14 @@ func logMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
 
-		// fmt.Printf("\n=== 收到请求 ===\n")
-		// fmt.Printf("时间: %s\n", startTime.Format("2006-01-02 15:04:05"))
-		// fmt.Printf("请求方法: %s\n", r.Method)
-		// fmt.Printf("请求路径: %s\n", r.URL.Path)
-		// fmt.Printf("客户端IP: %s\n", r.RemoteAddr)
-		// fmt.Printf("请求头:\n")
-		// for name, values := range r.Header {
-		// 	fmt.Printf("  %s: %s\n", name, strings.Join(values, ", "))
-		// }
+		// DEBUG_ACCESS_LOG=1 enables detailed access logging
+		if os.Getenv("DEBUG_ACCESS_LOG") == "1" || os.Getenv("DEBUG_ACCESS_LOG") == "true" {
+			fmt.Printf("\n=== 收到请求 ===\n")
+			fmt.Printf("时间: %s\n", startTime.Format("2006-01-02 15:04:05"))
+			fmt.Printf("请求方法: %s\n", r.Method)
+			fmt.Printf("请求路径: %s\n", r.URL.Path)
+			fmt.Printf("客户端IP: %s\n", r.RemoteAddr)
+		}
 
 		// 调用下一个处理器
 		next(w, r)
