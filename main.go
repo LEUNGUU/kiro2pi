@@ -1949,7 +1949,7 @@ processResponse:
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
 		},
-		"usage": map[string]any{"output_tokens": outputTokens},
+		"usage": map[string]any{"input_tokens": estimateInputTokens(anthropicReq), "output_tokens": outputTokens},
 	}
 	sendSSEEvent(w, flusher, "message_delta", messageDelta)
 
