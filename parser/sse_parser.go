@@ -35,6 +35,8 @@ type ParseResult struct {
 	ThinkingToolId  string // Original tool ID if thinking was used, empty otherwise
 	ThinkingInput   string // Accumulated thinking content for continuation
 	HasRegularTools bool   // True if response contains non-thinking tool calls
+	TextIndex       int    // Index used for text content blocks (0 if no thinking, 1 if thinking present)
+	HasThinking     bool   // True if response contains thinking blocks
 }
 
 func ParseEvents(resp []byte) []SSEEvent {
@@ -43,8 +45,10 @@ func ParseEvents(resp []byte) []SSEEvent {
 	startedTools := make(map[string]bool)  // Track which tool_use IDs have been started
 	toolIndexMap := make(map[string]int)   // Map tool_use ID to its index
 	thinkingToolIds := make(map[string]bool) // Track which tool IDs are thinking tools
-	nextToolIndex := 1                     // Next available index for tool_use (0 is reserved for text)
+	nextToolIndex := 2                     // Next available index for tools (0=thinking if present, 1=text)
 	lastContent := ""                      // Track last content for deduplication
+	hasThinking := false                   // Track if we've seen thinking blocks
+	textIndex := 0                         // Text index: 0 if no thinking, 1 if thinking present
 
 	r := bytes.NewReader(resp)
 	for {
@@ -95,7 +99,7 @@ func ParseEvents(resp []byte) []SSEEvent {
 
 			// Convert event to SSE, tracking started tools to avoid duplicate starts
 			// Also track content for deduplication
-			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent)
+			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex)
 			events = append(events, sseEvents...)
 
 			// Add message_delta for tool_use stop, but skip for thinking tools
@@ -275,7 +279,8 @@ func processThinkingInput(toolId string, fragment string) string {
 
 // convertAssistantEventWithTracking handles events with tool tracking to avoid duplicate content_block_start
 // Also implements content deduplication to prevent duplicate text content
-func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools map[string]bool, toolIndexMap map[string]int, thinkingToolIds map[string]bool, nextToolIndex *int, lastContent *string) []SSEEvent {
+// Index assignment: thinking gets index 0 (if present), text gets index 1 (or 0 if no thinking), tools get subsequent indexes
+func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools map[string]bool, toolIndexMap map[string]int, thinkingToolIds map[string]bool, nextToolIndex *int, lastContent *string, hasThinking *bool, textIndex *int) []SSEEvent {
 	var events []SSEEvent
 
 	// Convert "thinking" tool calls to thinking content blocks
@@ -285,8 +290,13 @@ func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools 
 		// Mark this tool ID as a thinking tool for future reference (e.g., stop events)
 		if evt.Name == "thinking" && evt.ToolUseId != "" {
 			thinkingToolIds[evt.ToolUseId] = true
+			// First thinking block gets index 0, adjust text to index 1
+			if !*hasThinking {
+				*hasThinking = true
+				*textIndex = 1 // Text will use index 1 since thinking uses index 0
+			}
 		}
-		return convertThinkingToolToThinkingBlock(evt, startedTools, toolIndexMap, nextToolIndex)
+		return convertThinkingToolToThinkingBlock(evt, startedTools, toolIndexMap, nextToolIndex, hasThinking)
 	}
 
 	// Debug: log what type of event we're processing
@@ -313,11 +323,27 @@ func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools 
 		}
 		*lastContent = evt.Content
 
+		// Send text content_block_start if this is the first text content
+		if !startedTools["__text__"] {
+			events = append(events, SSEEvent{
+				Event: "content_block_start",
+				Data: map[string]interface{}{
+					"type":  "content_block_start",
+					"index": *textIndex,
+					"content_block": map[string]interface{}{
+						"type": "text",
+						"text": "",
+					},
+				},
+			})
+			startedTools["__text__"] = true
+		}
+
 		events = append(events, SSEEvent{
 			Event: "content_block_delta",
 			Data: map[string]interface{}{
 				"type":  "content_block_delta",
-				"index": 0,
+				"index": *textIndex,
 				"delta": map[string]interface{}{
 					"type": "text_delta",
 					"text": evt.Content,
@@ -413,8 +439,10 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 	startedTools := make(map[string]bool)
 	toolIndexMap := make(map[string]int)
 	thinkingToolIds := make(map[string]bool)
-	nextToolIndex := 1 // (0 is reserved for text)
+	nextToolIndex := 2      // Next available index for tools (0=thinking if present, 1=text)
 	lastContent := ""
+	hasThinking := false    // Track if we've seen thinking blocks
+	textIndex := 0          // Text index: 0 if no thinking, 1 if thinking present
 
 	// Track thinking input fragments to accumulate full content
 	var thinkingInputBuilder strings.Builder
@@ -482,7 +510,7 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 				result.HasRegularTools = true
 			}
 
-			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent)
+			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex)
 			result.Events = append(result.Events, sseEvents...)
 
 			// Add message_delta for non-thinking tool_use stop
@@ -522,13 +550,18 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 		}
 	}
 
+	// Set text index and thinking flag in result
+	result.TextIndex = textIndex
+	result.HasThinking = hasThinking
+
 	return result
 }
 
 // convertThinkingToolToThinkingBlock converts a "thinking" tool call to thinking content blocks
 // The Q API implements thinking as a tool with input {"thought": "..."}, but Anthropic API
 // clients expect thinking as content blocks with type "thinking"
-func convertThinkingToolToThinkingBlock(evt assistantResponseEvent, startedTools map[string]bool, toolIndexMap map[string]int, nextToolIndex *int) []SSEEvent {
+// Thinking blocks always get index 0 to ensure they appear before text content
+func convertThinkingToolToThinkingBlock(evt assistantResponseEvent, startedTools map[string]bool, toolIndexMap map[string]int, nextToolIndex *int, hasThinking *bool) []SSEEvent {
 	var events []SSEEvent
 
 	// Use a special marker to track thinking blocks (prefixed tool ID)
@@ -541,12 +574,10 @@ func convertThinkingToolToThinkingBlock(evt assistantResponseEvent, startedTools
 
 	// Handle thinking tool start - emit thinking content_block_start
 	if evt.ToolUseId != "" && !evt.Stop {
-		// Get or assign index for this thinking block
-		thinkingIndex, exists := toolIndexMap[thinkingId]
-		if !exists {
-			thinkingIndex = *nextToolIndex
+		// Thinking always gets index 0 to appear before text content
+		thinkingIndex := 0
+		if _, exists := toolIndexMap[thinkingId]; !exists {
 			toolIndexMap[thinkingId] = thinkingIndex
-			*nextToolIndex++
 		}
 
 		// Only send content_block_start if we haven't started this thinking block yet
@@ -589,7 +620,7 @@ func convertThinkingToolToThinkingBlock(evt assistantResponseEvent, startedTools
 		}
 	} else if evt.Stop {
 		// Handle thinking tool stop - emit thinking content_block_stop
-		thinkingIndex := 1 // Default
+		thinkingIndex := 0 // Thinking always at index 0
 		if idx, exists := toolIndexMap[thinkingId]; exists {
 			thinkingIndex = idx
 		}
