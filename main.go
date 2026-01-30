@@ -858,6 +858,17 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					}
 					history = append(history, userMsg)
 					pendingUserContent = nil // Clear any pending content
+
+					// Check if the NEXT message is also a user message (not assistant)
+					// This can happen when user provides tool_result then sends a new text message
+					// CodeWhisperer requires strict alternation, so we need a synthetic assistant between them
+					if i+1 < len(anthropicReq.Messages)-1 && anthropicReq.Messages[i+1].Role == "user" {
+						log.Printf("DEBUG: Two consecutive user messages detected (tool_result followed by user text), adding synthetic assistant")
+						syntheticAssistant := HistoryAssistantMessage{}
+						syntheticAssistant.AssistantResponseMessage.MessageId = generateUUID()
+						syntheticAssistant.AssistantResponseMessage.Content = "I see the tool results. How would you like me to proceed?"
+						history = append(history, syntheticAssistant)
+					}
 					continue
 				}
 
@@ -985,17 +996,18 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 			}
 		}
 
-		// 处理最后剩余的pending用户消息
-		// Note: We don't add a default assistant response here because that would be
-		// artificial content that the model might mimic. The pending user content
-		// will be part of the current request context instead.
-		if len(pendingUserContent) > 0 {
-			// Check if last history entry is assistant with toolUses - need to add cancelled tool results
+		// Check if last history entry is assistant with toolUses - need to add cancelled tool results
+		// This check must run INDEPENDENTLY of pendingUserContent because the paired processing
+		// at lines 871-907 clears pendingUserContent, but may leave history ending with an assistant
+		// that has toolUses without a corresponding user message with toolResults.
+		// IMPORTANT: Only do this if lastMsg does NOT contain real tool_results - if it does,
+		// the real results go to currentMessage and we don't need cancelled results in history.
+		if !hasToolResult(lastMsg.Content) {
 			var cancelledResults []map[string]any
 			if len(history) > 0 {
 				if lastAssistant, ok := history[len(history)-1].(HistoryAssistantMessage); ok {
 					if len(lastAssistant.AssistantResponseMessage.ToolUses) > 0 {
-						log.Printf("DEBUG: Found orphaned tool calls in history, generating cancelled tool results")
+						log.Printf("DEBUG: Found orphaned tool calls in history (no tool_result in lastMsg), generating cancelled tool results")
 						for _, toolUse := range lastAssistant.AssistantResponseMessage.ToolUses {
 							if tu, ok := toolUse.(map[string]any); ok {
 								if toolUseId, ok := tu["toolUseId"].(string); ok {
@@ -1015,10 +1027,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 				}
 			}
 
-			userMsg := HistoryUserMessage{}
-			// When we have cancelled tool results, content should be empty and results go in toolResults
-			// The actual user content will be in currentMessage
+			// If we have cancelled tool results, add a user message with them
 			if len(cancelledResults) > 0 {
+				userMsg := HistoryUserMessage{}
 				userMsg.UserInputMessage.Content = ""
 				userMsg.UserInputMessage.Origin = "KIRO_CLI"
 				userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
@@ -1029,19 +1040,25 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					ToolResults: cancelledResults,
 				}
 				history = append(history, userMsg)
-				// Don't add the pending user content to history - it will be in currentMessage
-				log.Printf("DEBUG: Added user message with cancelled tool results, pending content will be in currentMessage")
-			} else {
-				userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
-				userMsg.UserInputMessage.Origin = "KIRO_CLI"
-				userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
-					EnvState: &EnvState{
-						OperatingSystem:         runtime.GOOS,
-						CurrentWorkingDirectory: cwd,
-					},
-				}
-				history = append(history, userMsg)
+				log.Printf("DEBUG: Added user message with cancelled tool results")
 			}
+		}
+
+		// 处理最后剩余的pending用户消息
+		// Note: We don't add a default assistant response here because that would be
+		// artificial content that the model might mimic. The pending user content
+		// will be part of the current request context instead.
+		if len(pendingUserContent) > 0 {
+			userMsg := HistoryUserMessage{}
+			userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
+			userMsg.UserInputMessage.Origin = "KIRO_CLI"
+			userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
+				EnvState: &EnvState{
+					OperatingSystem:         runtime.GOOS,
+					CurrentWorkingDirectory: cwd,
+				},
+			}
+			history = append(history, userMsg)
 		}
 
 		// Handle abort scenario: if the LAST message in anthropicReq.Messages is an assistant with toolUses,
