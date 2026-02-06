@@ -647,6 +647,7 @@ var ModelMap = map[string]string{
 	"claude-sonnet-4":           "claude-sonnet-4",
 	"claude-haiku-4.5":          "claude-haiku-4.5",
 	"claude-opus-4.5":           "claude-opus-4.5",
+	"claude-opus-4.6":           "claude-opus-4.6",
 	// Legacy mappings for compatibility
 	"claude-sonnet-4-20250514":  "claude-sonnet-4",
 	"claude-3-5-haiku-20241022": "claude-haiku-4.5",
@@ -1631,12 +1632,13 @@ func startServer(port string) {
 			{"id": "claude-sonnet-4", "type": "model", "display_name": "Claude Sonnet 4", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "claude-haiku-4.5", "type": "model", "display_name": "Claude Haiku 4.5", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "claude-opus-4.5", "type": "model", "display_name": "Claude Opus 4.5", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "claude-opus-4.6", "type": "model", "display_name": "Claude Opus 4.6", "created_at": "2025-01-01T00:00:00Z"},
 		}
 		resp := map[string]any{
 			"data":     models,
 			"has_more": false,
 			"first_id": "claude-sonnet-4.5",
-			"last_id":  "claude-opus-4.5",
+			"last_id":  "claude-opus-4.6",
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
