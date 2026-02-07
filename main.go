@@ -2123,6 +2123,7 @@ processNonStreamResponse:
 	context := ""
 	toolName := ""
 	toolUseId := ""
+	currentBlockType := "" // Track what type of block we're in: "text", "tool_use", "thinking"
 
 	contexts := []map[string]any{}
 
@@ -2132,7 +2133,25 @@ processNonStreamResponse:
 			if dataMap, ok := event.Data.(map[string]any); ok {
 				switch dataMap["type"] {
 				case "content_block_start":
-					context = ""
+					// Determine block type from content_block
+					currentBlockType = ""
+					if cb, ok := dataMap["content_block"].(map[string]any); ok {
+						if cbType, ok := cb["type"].(string); ok {
+							currentBlockType = cbType
+						}
+						switch currentBlockType {
+						case "tool_use":
+							partialJsonStr = ""
+							if id, ok := cb["id"].(string); ok {
+								toolUseId = id
+							}
+							if name, ok := cb["name"].(string); ok {
+								toolName = name
+							}
+						case "text":
+							context = ""
+						}
+					}
 				case "content_block_delta":
 					if delta, ok := dataMap["delta"]; ok {
 
@@ -2143,8 +2162,6 @@ processNonStreamResponse:
 									context += text.(string)
 								}
 							case "input_json_delta":
-								toolUseId = deltaMap["id"].(string)
-								toolName = deltaMap["name"].(string)
 								if partial_json, ok := deltaMap["partial_json"]; ok {
 									if strPtr, ok := partial_json.(*string); ok && strPtr != nil {
 										partialJsonStr = partialJsonStr + *strPtr
@@ -2162,34 +2179,36 @@ processNonStreamResponse:
 					}
 
 				case "content_block_stop":
-					if index, ok := dataMap["index"]; ok {
-						switch index {
-						case 1:
-							toolInput := map[string]interface{}{}
+					// Use tracked block type instead of hardcoded index
+					switch currentBlockType {
+					case "tool_use":
+						toolInput := map[string]interface{}{}
+						if partialJsonStr != "" {
 							if err := json.Unmarshal([]byte(partialJsonStr), &toolInput); err != nil {
 								log.Printf("json unmarshal error:%s", err.Error())
 							}
-
-							contexts = append(contexts, map[string]interface{}{
-								"type":  "tool_use",
-								"id":    toolUseId,
-								"name":  toolName,
-								"input": toolInput,
-							})
-						case 0:
-							contexts = append(contexts, map[string]interface{}{
-								"text": context,
-								"type": "text",
-							})
 						}
+
+						contexts = append(contexts, map[string]interface{}{
+							"type":  "tool_use",
+							"id":    toolUseId,
+							"name":  toolName,
+							"input": toolInput,
+						})
+					case "text":
+						contexts = append(contexts, map[string]interface{}{
+							"text": context,
+							"type": "text",
+						})
 					}
+					currentBlockType = ""
 				}
 
 			}
 		}
 	}
 
-	// 回退：如果已累积到文本但未收到 content_block_stop(index=0)，也要返回文本
+	// 回退：如果已累积到文本但未收到 content_block_stop，也要返回文本
 	if len(contexts) == 0 && strings.TrimSpace(context) != "" {
 		contexts = append(contexts, map[string]any{
 			"type": "text",
