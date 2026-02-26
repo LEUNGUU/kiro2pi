@@ -49,6 +49,7 @@ func ParseEvents(resp []byte) []SSEEvent {
 	lastContent := ""                      // Track last content for deduplication
 	hasThinking := false                   // Track if we've seen thinking blocks
 	textIndex := 0                         // Text index: 0 if no thinking, 1 if thinking present
+	tagParser := NewThinkingTagParser()    // Parser for <thinking> tags in text content
 
 	r := bytes.NewReader(resp)
 	for {
@@ -99,7 +100,7 @@ func ParseEvents(resp []byte) []SSEEvent {
 
 			// Convert event to SSE, tracking started tools to avoid duplicate starts
 			// Also track content for deduplication
-			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex)
+			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex, tagParser)
 			events = append(events, sseEvents...)
 
 			// Add message_delta for tool_use stop, but skip for thinking tools
@@ -277,10 +278,87 @@ func processThinkingInput(toolId string, fragment string) string {
 	return result
 }
 
+// emitThinkingEvents generates SSE events for thinking content from tag parser
+func emitThinkingEvents(tagResult ThinkingTagResult, startedTools map[string]bool) []SSEEvent {
+	var events []SSEEvent
+	thinkingKey := "__thinking_tag__"
+
+	if tagResult.IsFirstChunk && !startedTools[thinkingKey] {
+		events = append(events, SSEEvent{
+			Event: "content_block_start",
+			Data: map[string]interface{}{
+				"type":  "content_block_start",
+				"index": 0,
+				"content_block": map[string]interface{}{
+					"type":     "thinking",
+					"thinking": "",
+				},
+			},
+		})
+		startedTools[thinkingKey] = true
+	}
+
+	if tagResult.ThinkingContent != "" {
+		events = append(events, SSEEvent{
+			Event: "content_block_delta",
+			Data: map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": 0,
+				"delta": map[string]interface{}{
+					"type":     "thinking_delta",
+					"thinking": tagResult.ThinkingContent,
+				},
+			},
+		})
+	}
+
+	if tagResult.IsLastChunk {
+		events = append(events, SSEEvent{
+			Event: "content_block_stop",
+			Data: map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": 0,
+			},
+		})
+	}
+	return events
+}
+
+// emitTextEvents generates SSE events for regular text content
+func emitTextEvents(content string, startedTools map[string]bool, textIndex int) []SSEEvent {
+	var events []SSEEvent
+	if !startedTools["__text__"] {
+		events = append(events, SSEEvent{
+			Event: "content_block_start",
+			Data: map[string]interface{}{
+				"type":  "content_block_start",
+				"index": textIndex,
+				"content_block": map[string]interface{}{
+					"type": "text",
+					"text": "",
+				},
+			},
+		})
+		startedTools["__text__"] = true
+	}
+	events = append(events, SSEEvent{
+		Event: "content_block_delta",
+		Data: map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": textIndex,
+			"delta": map[string]interface{}{
+				"type": "text_delta",
+				"text": content,
+			},
+		},
+	})
+	return events
+}
+
 // convertAssistantEventWithTracking handles events with tool tracking to avoid duplicate content_block_start
 // Also implements content deduplication to prevent duplicate text content
 // Index assignment: thinking gets index 0 (if present), text gets index 1 (or 0 if no thinking), tools get subsequent indexes
-func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools map[string]bool, toolIndexMap map[string]int, thinkingToolIds map[string]bool, nextToolIndex *int, lastContent *string, hasThinking *bool, textIndex *int) []SSEEvent {
+func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools map[string]bool, toolIndexMap map[string]int, thinkingToolIds map[string]bool, nextToolIndex *int, lastContent *string, hasThinking *bool, textIndex *int, tagParser *ThinkingTagParser) []SSEEvent {
 	var events []SSEEvent
 
 	// Convert "thinking" tool calls to thinking content blocks
@@ -318,38 +396,26 @@ func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools 
 	if evt.Content != "" {
 		// Content deduplication: skip if same as last content
 		if evt.Content == *lastContent {
-			// Skip duplicate content
 			return events
 		}
 		*lastContent = evt.Content
 
-		// Send text content_block_start if this is the first text content
-		if !startedTools["__text__"] {
-			events = append(events, SSEEvent{
-				Event: "content_block_start",
-				Data: map[string]interface{}{
-					"type":  "content_block_start",
-					"index": *textIndex,
-					"content_block": map[string]interface{}{
-						"type": "text",
-						"text": "",
-					},
-				},
-			})
-			startedTools["__text__"] = true
+		// Parse content through thinking tag parser
+		tagResult := tagParser.Feed(evt.Content)
+
+		// Emit thinking content if found
+		if tagResult.ThinkingContent != "" {
+			if tagResult.IsFirstChunk && !*hasThinking {
+				*hasThinking = true
+				*textIndex = 1
+			}
+			events = append(events, emitThinkingEvents(tagResult, startedTools)...)
 		}
 
-		events = append(events, SSEEvent{
-			Event: "content_block_delta",
-			Data: map[string]interface{}{
-				"type":  "content_block_delta",
-				"index": *textIndex,
-				"delta": map[string]interface{}{
-					"type": "text_delta",
-					"text": evt.Content,
-				},
-			},
-		})
+		// Emit regular content if any
+		if tagResult.RegularContent != "" {
+			events = append(events, emitTextEvents(tagResult.RegularContent, startedTools, *textIndex)...)
+		}
 	} else if evt.ToolUseId != "" && evt.Name != "" && !evt.Stop {
 		// Get or assign index for this tool
 		toolIndex, exists := toolIndexMap[evt.ToolUseId]
@@ -443,6 +509,7 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 	lastContent := ""
 	hasThinking := false    // Track if we've seen thinking blocks
 	textIndex := 0          // Text index: 0 if no thinking, 1 if thinking present
+	tagParser := NewThinkingTagParser() // Parser for <thinking> tags in text content
 
 	// Track thinking input fragments to accumulate full content
 	var thinkingInputBuilder strings.Builder
@@ -510,7 +577,7 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 				result.HasRegularTools = true
 			}
 
-			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex)
+			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex, tagParser)
 			result.Events = append(result.Events, sseEvents...)
 
 			// Add message_delta for non-thinking tool_use stop

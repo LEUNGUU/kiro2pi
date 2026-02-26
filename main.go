@@ -34,6 +34,13 @@ const (
 	retryBaseDelay = 1 * time.Second
 )
 
+// Request size limits
+const (
+	maxRequestBytes        = 128 * 1024 // 128KB max request payload
+	maxToolResultContentLen = 10 * 1024  // 10KB max per tool result content
+	maxHistoryEntries      = 100         // Max history entries
+)
+
 // isRetryableStatusCode checks if the HTTP status code is retryable
 func isRetryableStatusCode(statusCode int) bool {
 	return statusCode == 429 || (statusCode >= 500 && statusCode < 600)
@@ -369,6 +376,7 @@ type CodeWhispererTool struct {
 type HistoryUserMessage struct {
 	UserInputMessage struct {
 		Content                 string                         `json:"content"`
+		ModelId                 string                         `json:"modelId,omitempty"`
 		UserInputMessageContext *HistoryUserInputMessageContext `json:"userInputMessageContext,omitempty"`
 		Origin                  string                         `json:"origin,omitempty"`
 	} `json:"userInputMessage"`
@@ -543,9 +551,9 @@ func extractToolResults(content any) []map[string]any {
 					// Handle content - support both text and json formats
 					switch c := m["content"].(type) {
 					case string:
-						// Simple text content
+						// Simple text content - truncate if too large
 						toolResult["content"] = []map[string]any{
-							{"text": c},
+							{"text": truncateString(c, maxToolResultContentLen)},
 						}
 					case []interface{}:
 						// Array of content blocks - convert to kiro format
@@ -553,17 +561,17 @@ func extractToolResults(content any) []map[string]any {
 						for _, block := range c {
 							if cb, ok := block.(map[string]interface{}); ok {
 								if text, ok := cb["text"].(string); ok {
-									contentBlocks = append(contentBlocks, map[string]any{"text": text})
+									contentBlocks = append(contentBlocks, map[string]any{"text": truncateString(text, maxToolResultContentLen)})
 								}
 							}
 						}
 						if len(contentBlocks) > 0 {
 							toolResult["content"] = contentBlocks
 						} else {
-							toolResult["content"] = []map[string]any{{"text": ""}}
+							toolResult["content"] = []map[string]any{{"text": "(empty result)"}}
 						}
 					default:
-						toolResult["content"] = []map[string]any{{"text": ""}}
+						toolResult["content"] = []map[string]any{{"text": "(empty result)"}}
 					}
 
 					toolResults = append(toolResults, toolResult)
@@ -648,9 +656,8 @@ var ModelMap = map[string]string{
 	"claude-haiku-4.5":          "claude-haiku-4.5",
 	"claude-opus-4.5":           "claude-opus-4.5",
 	"claude-opus-4.6":           "claude-opus-4.6",
-	// Legacy mappings for compatibility
-	"claude-sonnet-4-20250514":  "claude-sonnet-4",
-	"claude-3-5-haiku-20241022": "claude-haiku-4.5",
+	"claude-sonnet-4.6":         "claude-sonnet-4.6",
+
 }
 
 // generateUUID generates a simple UUID v4
@@ -715,6 +722,238 @@ func countMessageChars(content any) int {
 	return 0
 }
 
+// sanitizeJsonSchema removes fields that cause Q API "Improperly formed request" errors.
+// Specifically: empty required arrays and additionalProperties fields.
+func sanitizeJsonSchema(schema map[string]any) map[string]any {
+	if schema == nil {
+		return nil
+	}
+	result := make(map[string]any)
+	for key, value := range schema {
+		if key == "additionalProperties" {
+			continue
+		}
+		if key == "required" {
+			if arr, ok := value.([]interface{}); ok && len(arr) == 0 {
+				continue
+			}
+			if arr, ok := value.([]string); ok && len(arr) == 0 {
+				continue
+			}
+		}
+		switch v := value.(type) {
+		case map[string]any:
+			if key == "properties" {
+				props := make(map[string]any)
+				for pName, pVal := range v {
+					if pm, ok := pVal.(map[string]any); ok {
+						props[pName] = sanitizeJsonSchema(pm)
+					} else {
+						props[pName] = pVal
+					}
+				}
+				result[key] = props
+			} else {
+				result[key] = sanitizeJsonSchema(v)
+			}
+		case []interface{}:
+			sanitized := make([]interface{}, len(v))
+			for i, item := range v {
+				if m, ok := item.(map[string]any); ok {
+					sanitized[i] = sanitizeJsonSchema(m)
+				} else {
+					sanitized[i] = item
+				}
+			}
+			result[key] = sanitized
+		default:
+			result[key] = value
+		}
+	}
+	return result
+}
+
+// truncateString truncates a string to maxLen, appending "... [truncated]" if cut.
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	suffix := "... [truncated]"
+	if maxLen <= len(suffix) {
+		return s[:maxLen]
+	}
+	return s[:maxLen-len(suffix)] + suffix
+}
+
+// ensureFirstMessageIsUser prepends a synthetic user message if history doesn't start with one.
+func ensureFirstMessageIsUser(history []any) []any {
+	if len(history) == 0 {
+		return history
+	}
+	if _, ok := history[0].(HistoryUserMessage); ok {
+		return history
+	}
+	log.Printf("History does not start with user message, prepending synthetic user")
+	syntheticUser := HistoryUserMessage{}
+	syntheticUser.UserInputMessage.Content = "(empty)"
+	syntheticUser.UserInputMessage.Origin = "KIRO_CLI"
+	return append([]any{syntheticUser}, history...)
+}
+
+// ensureAlternatingRoles merges consecutive same-role messages to maintain strict user/assistant alternation.
+func ensureAlternatingRoles(history []any) []any {
+	if len(history) < 2 {
+		return history
+	}
+	var result []any
+	result = append(result, history[0])
+	for i := 1; i < len(history); i++ {
+		_, currIsUser := history[i].(HistoryUserMessage)
+		_, prevIsUser := result[len(result)-1].(HistoryUserMessage)
+
+		if currIsUser == prevIsUser {
+			// Same role — merge into previous
+			if currIsUser {
+				// Merge user messages
+				prev := result[len(result)-1].(HistoryUserMessage)
+				curr := history[i].(HistoryUserMessage)
+				if curr.UserInputMessage.Content != "" {
+					if prev.UserInputMessage.Content != "" {
+						prev.UserInputMessage.Content += "\n" + curr.UserInputMessage.Content
+					} else {
+						prev.UserInputMessage.Content = curr.UserInputMessage.Content
+					}
+				}
+				// Merge toolResults
+				if curr.UserInputMessage.UserInputMessageContext != nil && len(curr.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+					if prev.UserInputMessage.UserInputMessageContext == nil {
+						prev.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{}
+					}
+					prev.UserInputMessage.UserInputMessageContext.ToolResults = append(
+						prev.UserInputMessage.UserInputMessageContext.ToolResults,
+						curr.UserInputMessage.UserInputMessageContext.ToolResults...,
+					)
+				}
+				result[len(result)-1] = prev
+			} else {
+				// Merge assistant messages
+				prev := result[len(result)-1].(HistoryAssistantMessage)
+				curr := history[i].(HistoryAssistantMessage)
+				if curr.AssistantResponseMessage.Content != "" {
+					if prev.AssistantResponseMessage.Content != "" {
+						prev.AssistantResponseMessage.Content += "\n" + curr.AssistantResponseMessage.Content
+					} else {
+						prev.AssistantResponseMessage.Content = curr.AssistantResponseMessage.Content
+					}
+				}
+				// Merge toolUses
+				if len(curr.AssistantResponseMessage.ToolUses) > 0 {
+					prev.AssistantResponseMessage.ToolUses = append(
+						prev.AssistantResponseMessage.ToolUses,
+						curr.AssistantResponseMessage.ToolUses...,
+					)
+				}
+				result[len(result)-1] = prev
+			}
+			log.Printf("Merged consecutive %s message at index %d", map[bool]string{true: "user", false: "assistant"}[currIsUser], i)
+		} else {
+			result = append(result, history[i])
+		}
+	}
+	return result
+}
+
+// ensureAssistantBeforeToolResults converts orphaned toolResults to text.
+// After trimming, a user message may have toolResults with no preceding assistant toolUses.
+// The Q API rejects this. Matches kiro-gateway's ensure_assistant_before_tool_results.
+func ensureAssistantBeforeToolResults(history []any) []any {
+	for i, h := range history {
+		um, ok := h.(HistoryUserMessage)
+		if !ok || um.UserInputMessage.UserInputMessageContext == nil || len(um.UserInputMessage.UserInputMessageContext.ToolResults) == 0 {
+			continue
+		}
+		// Check if preceding message is an assistant with toolUses
+		hasPrecedingToolUses := false
+		if i > 0 {
+			if am, ok := history[i-1].(HistoryAssistantMessage); ok && len(am.AssistantResponseMessage.ToolUses) > 0 {
+				hasPrecedingToolUses = true
+			}
+		}
+		if hasPrecedingToolUses {
+			continue
+		}
+		// Convert orphaned toolResults to text
+		var parts []string
+		for _, tr := range um.UserInputMessage.UserInputMessageContext.ToolResults {
+			toolId, _ := tr["toolUseId"].(string)
+			if content, ok := tr["content"].([]map[string]any); ok {
+				for _, c := range content {
+					if text, ok := c["text"].(string); ok {
+						parts = append(parts, fmt.Sprintf("[Tool result %s]: %s", toolId, truncateString(text, 500)))
+					}
+				}
+			}
+		}
+		if len(parts) > 0 {
+			text := strings.Join(parts, "\n")
+			if um.UserInputMessage.Content != "" {
+				um.UserInputMessage.Content += "\n\n" + text
+			} else {
+				um.UserInputMessage.Content = text
+			}
+		}
+		um.UserInputMessage.UserInputMessageContext.ToolResults = nil
+		history[i] = um
+		log.Printf("Converted %d orphaned toolResults to text at history[%d]", len(parts), i)
+	}
+	return history
+}
+
+// trimHistoryToFit drops oldest history pairs until the serialized request fits within maxRequestBytes
+// and history count is within maxHistoryEntries. Re-validates structure after trimming.
+func trimHistoryToFit(cwReq *CodeWhispererRequest) {
+	history := cwReq.ConversationState.History
+	trimmed := false
+
+	// First enforce max history entries
+	for len(history) > maxHistoryEntries {
+		if len(history) <= 2 {
+			break
+		}
+		log.Printf("History length %d exceeds %d, dropping oldest pair", len(history), maxHistoryEntries)
+		history = history[2:]
+		trimmed = true
+	}
+	cwReq.ConversationState.History = history
+
+	// Then enforce max request size
+	for {
+		reqBytes, err := json.Marshal(cwReq)
+		if err != nil || len(reqBytes) <= maxRequestBytes {
+			break
+		}
+		history = cwReq.ConversationState.History
+		if len(history) <= 2 {
+			log.Printf("WARNING: Request size %d exceeds limit %d but cannot trim further (history len=%d)",
+				len(reqBytes), maxRequestBytes, len(history))
+			break
+		}
+		log.Printf("Request size %d exceeds %d, dropping oldest history pair (remaining=%d)",
+			len(reqBytes), maxRequestBytes, len(history)-2)
+		cwReq.ConversationState.History = history[2:]
+		trimmed = true
+	}
+
+	// Re-validate structure after trimming
+	if trimmed {
+		h := cwReq.ConversationState.History
+		h = ensureAssistantBeforeToolResults(h)
+		h = ensureFirstMessageIsUser(h)
+		h = ensureAlternatingRoles(h)
+		cwReq.ConversationState.History = h
+	}
+}
+
 func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererRequest {
 	// 使用从kiro-cli读取的profile ARN，如果没有则从环境变量读取
 	profileArn := kiroCliProfileArn
@@ -741,13 +980,14 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 		cwReq.ConversationState.CurrentMessage.UserInputMessage.Content = getMessageContent(lastMsg.Content)
 	}
 	// Map Anthropic model to CodeWhisperer model, fallback to "auto"
+	modelId := "auto"
 	if mappedModel, ok := ModelMap[anthropicReq.Model]; ok {
-		cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId = mappedModel
+		modelId = mappedModel
 		log.Printf("Model mapping: %s -> %s", anthropicReq.Model, mappedModel)
 	} else {
-		cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId = "auto"
 		log.Printf("Model not in map, using auto. Requested: %s", anthropicReq.Model)
 	}
+	cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId = modelId
 	// Use KIRO_CLI origin like kiro-cli does
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.Origin = "KIRO_CLI"
 
@@ -767,7 +1007,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 		cwTool.ToolSpecification.Name = tool.Name
 		cwTool.ToolSpecification.Description = tool.Description
 		cwTool.ToolSpecification.InputSchema = InputSchema{
-			Json: tool.InputSchema,
+			Json: sanitizeJsonSchema(tool.InputSchema),
 		}
 		tools = append(tools, cwTool)
 	}
@@ -814,27 +1054,14 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 		// Check if we have tool results (meaning this is a continuation after tool use)
 		hasToolResultInMessages := hasToolResult(lastMsg.Content)
 
-		// 首先添加每个 system 消息作为独立的历史记录项
-		// NOTE: When sending tool results, kiro-cli does NOT include system prompt in history
-		assistantDefaultMsg := HistoryAssistantMessage{}
-		assistantDefaultMsg.AssistantResponseMessage.MessageId = generateUUID()
-		assistantDefaultMsg.AssistantResponseMessage.Content = "I will follow these instructions"
-		// ToolUses left nil - omitempty will exclude it from JSON (matching kiro-cli behavior)
-
+		// Concatenate system prompt for prepending to first user message later
+		var systemPrompt string
 		if len(anthropicReq.System) > 0 && !hasToolResultInMessages {
+			var parts []string
 			for _, sysMsg := range anthropicReq.System {
-				userMsg := HistoryUserMessage{}
-				userMsg.UserInputMessage.Content = sysMsg.Text
-				userMsg.UserInputMessage.Origin = "KIRO_CLI"
-				userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
-					EnvState: &EnvState{
-						OperatingSystem:         runtime.GOOS,
-						CurrentWorkingDirectory: cwd,
-					},
-				}
-				history = append(history, userMsg)
-				history = append(history, assistantDefaultMsg)
+				parts = append(parts, sysMsg.Text)
 			}
+			systemPrompt = strings.Join(parts, "\n\n")
 		}
 
 		// 然后处理常规消息历史 - 确保严格交替 user/assistant
@@ -849,6 +1076,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					toolResults := extractToolResults(msg.Content)
 					userMsg := HistoryUserMessage{}
 					userMsg.UserInputMessage.Content = "" // Empty when sending tool results
+					userMsg.UserInputMessage.ModelId = modelId
 					userMsg.UserInputMessage.Origin = "KIRO_CLI"
 					userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 						EnvState: &EnvState{
@@ -893,6 +1121,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 						if len(pendingUserContent) > 0 {
 							userMsg := HistoryUserMessage{}
 							userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
+							userMsg.UserInputMessage.ModelId = modelId
 							userMsg.UserInputMessage.Origin = "KIRO_CLI"
 							userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 								EnvState: &EnvState{
@@ -953,6 +1182,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 						}
 						userMsg := HistoryUserMessage{}
 						userMsg.UserInputMessage.Content = ""
+						userMsg.UserInputMessage.ModelId = modelId
 						userMsg.UserInputMessage.Origin = "KIRO_CLI"
 						userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 							EnvState: &EnvState{
@@ -971,6 +1201,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					if len(pendingUserContent) > 0 {
 						userMsg := HistoryUserMessage{}
 						userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
+						userMsg.UserInputMessage.ModelId = modelId
 						userMsg.UserInputMessage.Origin = "KIRO_CLI"
 						userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 							EnvState: &EnvState{
@@ -1032,6 +1263,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 			if len(cancelledResults) > 0 {
 				userMsg := HistoryUserMessage{}
 				userMsg.UserInputMessage.Content = ""
+				userMsg.UserInputMessage.ModelId = modelId
 				userMsg.UserInputMessage.Origin = "KIRO_CLI"
 				userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 					EnvState: &EnvState{
@@ -1052,6 +1284,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 		if len(pendingUserContent) > 0 {
 			userMsg := HistoryUserMessage{}
 			userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
+			userMsg.UserInputMessage.ModelId = modelId
 			userMsg.UserInputMessage.Origin = "KIRO_CLI"
 			userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 				EnvState: &EnvState{
@@ -1092,6 +1325,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 				if len(cancelledResults) > 0 {
 					userMsg := HistoryUserMessage{}
 					userMsg.UserInputMessage.Content = ""
+					userMsg.UserInputMessage.ModelId = modelId
 					userMsg.UserInputMessage.Origin = "KIRO_CLI"
 					userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 						EnvState: &EnvState{
@@ -1106,10 +1340,30 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 			}
 		}
 
+		// Prepend system prompt to the first user message in history (matching kiro-gateway behavior)
+		if systemPrompt != "" && len(history) > 0 {
+			for i, h := range history {
+				if um, ok := h.(HistoryUserMessage); ok {
+					um.UserInputMessage.Content = systemPrompt + "\n\n" + um.UserInputMessage.Content
+					history[i] = um
+					log.Printf("Prepended system prompt to history[%d]", i)
+					break
+				}
+			}
+		}
+
+		// Validation pipeline: ensure proper message structure
+		history = ensureAssistantBeforeToolResults(history)
+		history = ensureFirstMessageIsUser(history)
+		history = ensureAlternatingRoles(history)
+
 		cwReq.ConversationState.History = history
 
-		log.Printf("DEBUG buildCodeWhispererRequest: history length=%d", len(history))
-		for idx, h := range history {
+		// Trim history if request is too large
+		trimHistoryToFit(&cwReq)
+
+		log.Printf("DEBUG buildCodeWhispererRequest: history length=%d", len(cwReq.ConversationState.History))
+		for idx, h := range cwReq.ConversationState.History {
 			if hBytes, err := json.Marshal(h); err == nil {
 				log.Printf("DEBUG history[%d]: %s", idx, string(hBytes)[:min(200, len(string(hBytes)))])
 			}
@@ -1140,6 +1394,7 @@ func buildThinkingContinuationRequest(prevReq CodeWhispererRequest, thinkingTool
 	// Build user message for history (matching kiro-cli format)
 	userMsg := HistoryUserMessage{}
 	userMsg.UserInputMessage.Content = prevUserContent // Can be empty if sending tool results
+	userMsg.UserInputMessage.ModelId = prevReq.ConversationState.CurrentMessage.UserInputMessage.ModelId
 	userMsg.UserInputMessage.Origin = "KIRO_CLI"
 	userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 		EnvState: prevEnvState,
@@ -1633,6 +1888,7 @@ func startServer(port string) {
 			{"id": "claude-haiku-4.5", "type": "model", "display_name": "Claude Haiku 4.5", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "claude-opus-4.5", "type": "model", "display_name": "Claude Opus 4.5", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "claude-opus-4.6", "type": "model", "display_name": "Claude Opus 4.6", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "claude-sonnet-4.6", "type": "model", "display_name": "Claude Sonnet 4.6", "created_at": "2025-01-01T00:00:00Z"},
 		}
 		resp := map[string]any{
 			"data":     models,
