@@ -121,12 +121,15 @@ eval $(./kiro2pi export)
 | Variable | Description |
 |----------|-------------|
 | `CODEWHISPERER_PROFILE_ARN` | Required if not using kiro-cli. Your CodeWhisperer profile ARN |
-| `DEBUG_SAVE_RAW` | Set to `true` to save raw API responses for debugging |
+| `DEBUG_SAVE_RAW` | Set to `1` or `true` to save raw API responses for debugging |
+| `DEBUG_ACCESS_LOG` | Set to `1` or `true` to enable detailed HTTP access logging |
 
 ## Platform Support
 
-- **Linux** — Reads kiro-cli database from `~/.config/kiro-cli/`; can run as a systemd service
-- **macOS** — Reads kiro-cli database from `~/Library/Application Support/kiro-cli/`; can run as a launchd service (see below)
+- **Linux** — Can run as a systemd service
+- **macOS** — Can run as a launchd service (see below)
+
+The kiro-cli database path is detected automatically based on the platform.
 
 ### macOS launchd Setup
 
@@ -174,7 +177,9 @@ The proxy maps model names to CodeWhisperer models:
 | Request Model | CodeWhisperer Model |
 |---------------|---------------------|
 | `claude-opus-4.5` | `claude-opus-4.5` |
+| `claude-opus-4.6` | `claude-opus-4.6` |
 | `claude-sonnet-4.5` | `claude-sonnet-4.5` |
+| `claude-sonnet-4.6` | `claude-sonnet-4.6` |
 | `claude-sonnet-4` | `claude-sonnet-4` |
 | `claude-haiku-4.5` | `claude-haiku-4.5` |
 
