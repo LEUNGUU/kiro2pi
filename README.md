@@ -178,8 +178,6 @@ The proxy maps model names to CodeWhisperer models:
 | `claude-sonnet-4` | `claude-sonnet-4` |
 | `claude-haiku-4.5` | `claude-haiku-4.5` |
 
-Legacy model names (e.g. `claude-3-5-sonnet-20241022`) are also supported for backward compatibility.
-
 ## Known Limitations
 
 - Context window is limited by CodeWhisperer (use 128K in config to be safe)
