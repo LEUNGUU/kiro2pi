@@ -36,9 +36,8 @@ const (
 
 // Request size limits
 const (
-	maxRequestBytes        = 128 * 1024 // 128KB max request payload
+	maxRequestBytes        = 590 * 1024 // 590KB max request payload (Kiro API hard limit is ~615KB)
 	maxToolResultContentLen = 10 * 1024  // 10KB max per tool result content
-	maxHistoryEntries      = 100         // Max history entries
 )
 
 // isRetryableStatusCode checks if the HTTP status code is retryable
@@ -909,30 +908,18 @@ func ensureAssistantBeforeToolResults(history []any) []any {
 	return history
 }
 
-// trimHistoryToFit drops oldest history pairs until the serialized request fits within maxRequestBytes
-// and history count is within maxHistoryEntries. Re-validates structure after trimming.
+// trimHistoryToFit drops oldest history pairs until the serialized request fits within maxRequestBytes.
+// Re-validates structure after trimming.
 func trimHistoryToFit(cwReq *CodeWhispererRequest) {
-	history := cwReq.ConversationState.History
 	trimmed := false
 
-	// First enforce max history entries
-	for len(history) > maxHistoryEntries {
-		if len(history) <= 2 {
-			break
-		}
-		log.Printf("History length %d exceeds %d, dropping oldest pair", len(history), maxHistoryEntries)
-		history = history[2:]
-		trimmed = true
-	}
-	cwReq.ConversationState.History = history
-
-	// Then enforce max request size
+	// Enforce max request size
 	for {
 		reqBytes, err := json.Marshal(cwReq)
 		if err != nil || len(reqBytes) <= maxRequestBytes {
 			break
 		}
-		history = cwReq.ConversationState.History
+		history := cwReq.ConversationState.History
 		if len(history) <= 2 {
 			log.Printf("WARNING: Request size %d exceeds limit %d but cannot trim further (history len=%d)",
 				len(reqBytes), maxRequestBytes, len(history))
