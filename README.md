@@ -76,7 +76,7 @@ Add to `~/.pi/agent/models.json`:
           "reasoning": true,
           "input": ["text", "image"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-          "contextWindow": 500000,
+          "contextWindow": 128000,
           "maxTokens": 64000
         },
         {
@@ -85,7 +85,7 @@ Add to `~/.pi/agent/models.json`:
           "reasoning": true,
           "input": ["text", "image"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-          "contextWindow": 500000,
+          "contextWindow": 128000,
           "maxTokens": 64000
         }
       ]
@@ -180,7 +180,7 @@ The proxy maps model names to CodeWhisperer models:
 
 ## Known Limitations
 
-- Context window is limited by CodeWhisperer (use 500K in config)
+- Context window is limited by CodeWhisperer (use 128K in config to be safe)
 - Input token counts are estimated (chars/4 heuristic)
 
 ## Credits
