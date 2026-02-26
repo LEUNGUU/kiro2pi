@@ -121,7 +121,14 @@ func getKiroCliDbPath() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(homeDir, ".local", "share", "kiro-cli", "data.sqlite3")
+	var dataDir string
+	switch runtime.GOOS {
+	case "darwin":
+		dataDir = filepath.Join(homeDir, "Library", "Application Support")
+	default:
+		dataDir = filepath.Join(homeDir, ".local", "share")
+	}
+	return filepath.Join(dataDir, "kiro-cli", "data.sqlite3")
 }
 
 // getTokenFromKiroCli 从kiro-cli SQLite数据库读取token
@@ -375,7 +382,6 @@ type CodeWhispererTool struct {
 type HistoryUserMessage struct {
 	UserInputMessage struct {
 		Content                 string                         `json:"content"`
-		ModelId                 string                         `json:"modelId,omitempty"`
 		UserInputMessageContext *HistoryUserInputMessageContext `json:"userInputMessageContext,omitempty"`
 		Origin                  string                         `json:"origin,omitempty"`
 	} `json:"userInputMessage"`
@@ -567,10 +573,10 @@ func extractToolResults(content any) []map[string]any {
 						if len(contentBlocks) > 0 {
 							toolResult["content"] = contentBlocks
 						} else {
-							toolResult["content"] = []map[string]any{{"text": "(empty result)"}}
+							toolResult["content"] = []map[string]any{{"text": ""}}
 						}
 					default:
-						toolResult["content"] = []map[string]any{{"text": "(empty result)"}}
+						toolResult["content"] = []map[string]any{{"text": ""}}
 					}
 
 					toolResults = append(toolResults, toolResult)
@@ -640,6 +646,22 @@ type EnvState struct {
 	CurrentWorkingDirectory string `json:"currentWorkingDirectory"`
 }
 
+// goosToQApi maps Go's runtime.GOOS to Q API accepted operatingSystem values.
+// The Q API accepts: LINUX, MAC, WINDOWS (from kiro-cli binary).
+// Go's runtime.GOOS returns "darwin", "linux", "windows".
+func goosToQApi(goos string) string {
+	switch goos {
+	case "darwin":
+		return "macos"
+	case "linux":
+		return "linux"
+	case "windows":
+		return "windows"
+	default:
+		return goos
+	}
+}
+
 // CodeWhispererEvent 表示 CodeWhisperer 的事件响应
 type CodeWhispererEvent struct {
 	ContentType string `json:"content-type"`
@@ -656,7 +678,9 @@ var ModelMap = map[string]string{
 	"claude-opus-4.5":           "claude-opus-4.5",
 	"claude-opus-4.6":           "claude-opus-4.6",
 	"claude-sonnet-4.6":         "claude-sonnet-4.6",
-
+	// Legacy mappings for compatibility
+	"claude-sonnet-4-20250514":  "claude-sonnet-4",
+	"claude-3-5-haiku-20241022": "claude-haiku-4.5",
 }
 
 // generateUUID generates a simple UUID v4
@@ -978,12 +1002,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 	// Use KIRO_CLI origin like kiro-cli does
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.Origin = "KIRO_CLI"
 
-	// Add environment state
-	// Extract cwd from system prompt (sent by clients like pi-agent) instead of os.Getwd()
-	// because kiro2cc runs as a service with its own working directory
+	// cwd extraction for history messages
 	cwd := extractCwdFromSystemPrompt(anthropicReq.System)
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.EnvState = &EnvState{
-		OperatingSystem:         runtime.GOOS,
+		OperatingSystem:         goosToQApi(runtime.GOOS),
 		CurrentWorkingDirectory: cwd,
 	}
 
@@ -1063,11 +1085,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					toolResults := extractToolResults(msg.Content)
 					userMsg := HistoryUserMessage{}
 					userMsg.UserInputMessage.Content = "" // Empty when sending tool results
-					userMsg.UserInputMessage.ModelId = modelId
 					userMsg.UserInputMessage.Origin = "KIRO_CLI"
 					userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 						EnvState: &EnvState{
-							OperatingSystem:         runtime.GOOS,
+							OperatingSystem:         goosToQApi(runtime.GOOS),
 							CurrentWorkingDirectory: cwd,
 						},
 						ToolResults: toolResults,
@@ -1108,11 +1129,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 						if len(pendingUserContent) > 0 {
 							userMsg := HistoryUserMessage{}
 							userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
-							userMsg.UserInputMessage.ModelId = modelId
 							userMsg.UserInputMessage.Origin = "KIRO_CLI"
 							userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 								EnvState: &EnvState{
-									OperatingSystem:         runtime.GOOS,
+									OperatingSystem:         goosToQApi(runtime.GOOS),
 									CurrentWorkingDirectory: cwd,
 								},
 							}
@@ -1169,11 +1189,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 						}
 						userMsg := HistoryUserMessage{}
 						userMsg.UserInputMessage.Content = ""
-						userMsg.UserInputMessage.ModelId = modelId
 						userMsg.UserInputMessage.Origin = "KIRO_CLI"
 						userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 							EnvState: &EnvState{
-								OperatingSystem:         runtime.GOOS,
+								OperatingSystem:         goosToQApi(runtime.GOOS),
 								CurrentWorkingDirectory: cwd,
 							},
 							ToolResults: cancelledResults,
@@ -1188,11 +1207,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					if len(pendingUserContent) > 0 {
 						userMsg := HistoryUserMessage{}
 						userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
-						userMsg.UserInputMessage.ModelId = modelId
 						userMsg.UserInputMessage.Origin = "KIRO_CLI"
 						userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 							EnvState: &EnvState{
-								OperatingSystem:         runtime.GOOS,
+								OperatingSystem:         goosToQApi(runtime.GOOS),
 								CurrentWorkingDirectory: cwd,
 							},
 						}
@@ -1250,11 +1268,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 			if len(cancelledResults) > 0 {
 				userMsg := HistoryUserMessage{}
 				userMsg.UserInputMessage.Content = ""
-				userMsg.UserInputMessage.ModelId = modelId
 				userMsg.UserInputMessage.Origin = "KIRO_CLI"
 				userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 					EnvState: &EnvState{
-						OperatingSystem:         runtime.GOOS,
+						OperatingSystem:         goosToQApi(runtime.GOOS),
 						CurrentWorkingDirectory: cwd,
 					},
 					ToolResults: cancelledResults,
@@ -1271,11 +1288,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 		if len(pendingUserContent) > 0 {
 			userMsg := HistoryUserMessage{}
 			userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
-			userMsg.UserInputMessage.ModelId = modelId
 			userMsg.UserInputMessage.Origin = "KIRO_CLI"
 			userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 				EnvState: &EnvState{
-					OperatingSystem:         runtime.GOOS,
+					OperatingSystem:         goosToQApi(runtime.GOOS),
 					CurrentWorkingDirectory: cwd,
 				},
 			}
@@ -1312,11 +1328,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 				if len(cancelledResults) > 0 {
 					userMsg := HistoryUserMessage{}
 					userMsg.UserInputMessage.Content = ""
-					userMsg.UserInputMessage.ModelId = modelId
 					userMsg.UserInputMessage.Origin = "KIRO_CLI"
 					userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 						EnvState: &EnvState{
-							OperatingSystem:         runtime.GOOS,
+							OperatingSystem:         goosToQApi(runtime.GOOS),
 							CurrentWorkingDirectory: cwd,
 						},
 						ToolResults: cancelledResults,
@@ -1381,7 +1396,6 @@ func buildThinkingContinuationRequest(prevReq CodeWhispererRequest, thinkingTool
 	// Build user message for history (matching kiro-cli format)
 	userMsg := HistoryUserMessage{}
 	userMsg.UserInputMessage.Content = prevUserContent // Can be empty if sending tool results
-	userMsg.UserInputMessage.ModelId = prevReq.ConversationState.CurrentMessage.UserInputMessage.ModelId
 	userMsg.UserInputMessage.Origin = "KIRO_CLI"
 	userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserInputMessageContext{
 		EnvState: prevEnvState,
@@ -2451,7 +2465,7 @@ processNonStreamResponse:
 		}
 	}
 
-	// 回退：如果已累积到文本但未收到 content_block_stop，也要返回文本
+	// 回退：如果已累积到文本但未收到 content_block_stop(index=0)，也要返回文本
 	if len(contexts) == 0 && strings.TrimSpace(context) != "" {
 		contexts = append(contexts, map[string]any{
 			"type": "text",
