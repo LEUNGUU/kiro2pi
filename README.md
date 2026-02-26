@@ -121,7 +121,54 @@ eval $(./kiro2pi export)
 | Variable | Description |
 |----------|-------------|
 | `CODEWHISPERER_PROFILE_ARN` | Required if not using kiro-cli. Your CodeWhisperer profile ARN |
-| `DEBUG_SAVE_RAW` | Set to `true` to save raw API responses for debugging |
+| `DEBUG_SAVE_RAW` | Set to `1` or `true` to save raw API responses for debugging |
+| `DEBUG_ACCESS_LOG` | Set to `1` or `true` to enable detailed HTTP access logging |
+
+## Platform Support
+
+- **Linux** — Can run as a systemd service
+- **macOS** — Can run as a launchd service (see below)
+
+The kiro-cli database path is detected automatically based on the platform.
+
+### macOS launchd Setup
+
+Create `~/Library/LaunchAgents/com.leunguu.kiro2pi.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.leunguu.kiro2pi</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/kiro2pi</string>
+        <string>server</string>
+        <string>9090</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/<username>/Library/Logs/kiro2pi.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/<username>/Library/Logs/kiro2pi.error.log</string>
+</dict>
+</plist>
+```
+
+Then load it:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.leunguu.kiro2pi.plist
+```
+
+### Linux systemd Setup
+
+See [AGENTS.md](AGENTS.md) for systemd service configuration.
 
 ## Supported Models
 
@@ -130,7 +177,9 @@ The proxy maps model names to CodeWhisperer models:
 | Request Model | CodeWhisperer Model |
 |---------------|---------------------|
 | `claude-opus-4.5` | `claude-opus-4.5` |
+| `claude-opus-4.6` | `claude-opus-4.6` |
 | `claude-sonnet-4.5` | `claude-sonnet-4.5` |
+| `claude-sonnet-4.6` | `claude-sonnet-4.6` |
 | `claude-sonnet-4` | `claude-sonnet-4` |
 | `claude-haiku-4.5` | `claude-haiku-4.5` |
 

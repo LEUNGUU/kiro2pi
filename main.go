@@ -678,9 +678,6 @@ var ModelMap = map[string]string{
 	"claude-opus-4.5":           "claude-opus-4.5",
 	"claude-opus-4.6":           "claude-opus-4.6",
 	"claude-sonnet-4.6":         "claude-sonnet-4.6",
-	// Legacy mappings for compatibility
-	"claude-sonnet-4-20250514":  "claude-sonnet-4",
-	"claude-3-5-haiku-20241022": "claude-haiku-4.5",
 }
 
 // generateUUID generates a simple UUID v4
