@@ -1057,12 +1057,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 	if len(anthropicReq.System) > 0 || len(anthropicReq.Messages) > 1 {
 		var history []any
 
-		// Check if we have tool results (meaning this is a continuation after tool use)
-		hasToolResultInMessages := hasToolResult(lastMsg.Content)
-
 		// Concatenate system prompt for prepending to first user message later
 		var systemPrompt string
-		if len(anthropicReq.System) > 0 && !hasToolResultInMessages {
+		if len(anthropicReq.System) > 0 {
 			var parts []string
 			for _, sysMsg := range anthropicReq.System {
 				parts = append(parts, sysMsg.Text)
@@ -1349,6 +1346,12 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					break
 				}
 			}
+		}
+
+		// When history is empty (first message in conversation), prepend system prompt to currentMessage
+		if systemPrompt != "" && len(history) == 0 {
+			cwReq.ConversationState.CurrentMessage.UserInputMessage.Content = systemPrompt + "\n\n" + cwReq.ConversationState.CurrentMessage.UserInputMessage.Content
+			log.Printf("Prepended system prompt to currentMessage (no history)")
 		}
 
 		// Validation pipeline: ensure proper message structure
