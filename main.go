@@ -678,6 +678,9 @@ var ModelMap = map[string]string{
 	"claude-opus-4.5":           "claude-opus-4.5",
 	"claude-opus-4.6":           "claude-opus-4.6",
 	"claude-sonnet-4.6":         "claude-sonnet-4.6",
+	"deepseek-3.2":              "deepseek-3.2",
+	"minimax-m2.5":              "minimax-m2.5",
+	"glm-5":                     "glm-5",
 }
 
 // generateUUID generates a simple UUID v4
@@ -1890,12 +1893,15 @@ func startServer(port string) {
 			{"id": "claude-opus-4.5", "type": "model", "display_name": "Claude Opus 4.5", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "claude-opus-4.6", "type": "model", "display_name": "Claude Opus 4.6", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "claude-sonnet-4.6", "type": "model", "display_name": "Claude Sonnet 4.6", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "deepseek-3.2", "type": "model", "display_name": "DeepSeek 3.2", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "minimax-m2.5", "type": "model", "display_name": "MiniMax M2.5", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "glm-5", "type": "model", "display_name": "GLM-5", "created_at": "2025-01-01T00:00:00Z"},
 		}
 		resp := map[string]any{
 			"data":     models,
 			"has_more": false,
 			"first_id": "claude-sonnet-4.5",
-			"last_id":  "claude-opus-4.6",
+			"last_id":  "glm-5",
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
