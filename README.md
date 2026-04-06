@@ -22,6 +22,7 @@ kiro2pi translates Anthropic API requests to CodeWhisperer Q API format, allowin
 - Extended thinking support (via thinking tool)
 - Automatic token refresh on 403 errors
 - Retry with exponential backoff for rate limits
+- Image/multimodal support (base64 PNG, JPEG, WebP, GIF)
 
 ## Prerequisites
 
@@ -187,6 +188,7 @@ The proxy maps model names to CodeWhisperer models:
 
 - Context window is limited by CodeWhisperer (use 128K in config to be safe)
 - Input token counts are estimated (chars/4 heuristic)
+- URL-based image sources are not supported (only base64)
 
 ## Credits
 
