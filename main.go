@@ -384,7 +384,18 @@ type HistoryUserMessage struct {
 		Content                 string                         `json:"content"`
 		UserInputMessageContext *HistoryUserInputMessageContext `json:"userInputMessageContext,omitempty"`
 		Origin                  string                         `json:"origin,omitempty"`
+		Images                  []KiroImage                    `json:"images,omitempty"`
 	} `json:"userInputMessage"`
+}
+
+// KiroImage represents an image in Kiro API format
+type KiroImage struct {
+	Format string          `json:"format"`
+	Source KiroImageSource `json:"source"`
+}
+
+type KiroImageSource struct {
+	Bytes string `json:"bytes"`
 }
 
 type HistoryUserInputMessageContext struct {
@@ -502,6 +513,59 @@ func getMessageContent(content any) string {
 		// Don't log SSE event data as "uncatch" - it's expected during streaming
 		return ""
 	}
+}
+
+// extractImages extracts image content blocks from Anthropic messages and converts to Kiro format.
+// Anthropic format: {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
+// Kiro format: {"format": "png", "source": {"bytes": "..."}}
+func extractImages(content any) []KiroImage {
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return nil
+	}
+	var images []KiroImage
+	for _, block := range blocks {
+		m, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if m["type"] != "image" {
+			continue
+		}
+		source, ok := m["source"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// Only support base64 source type
+		sourceType, _ := source["type"].(string)
+		if sourceType != "base64" {
+			if sourceType == "url" {
+				log.Printf("WARNING: URL-based images are not supported, skipping")
+			}
+			continue
+		}
+		data, _ := source["data"].(string)
+		if data == "" {
+			continue
+		}
+		mediaType, _ := source["media_type"].(string)
+		if mediaType == "" {
+			mediaType = "image/jpeg"
+		}
+		// Extract format from media_type: "image/jpeg" -> "jpeg"
+		format := mediaType
+		if idx := strings.LastIndex(mediaType, "/"); idx >= 0 {
+			format = mediaType[idx+1:]
+		}
+		images = append(images, KiroImage{
+			Format: format,
+			Source: KiroImageSource{Bytes: data},
+		})
+	}
+	if len(images) > 0 {
+		log.Printf("Extracted %d image(s) from content", len(images))
+	}
+	return images
 }
 
 // extractToolUses extracts tool_use blocks from message content
@@ -628,6 +692,7 @@ type CodeWhispererRequest struct {
 				Content                 string `json:"content"`
 				ModelId                 string `json:"modelId"`
 				Origin                  string `json:"origin"`
+				Images                  []KiroImage `json:"images,omitempty"`
 				UserInputMessageContext struct {
 					ToolResults []map[string]any    `json:"toolResults,omitempty"`
 					Tools       []CodeWhispererTool `json:"tools,omitempty"`
@@ -857,6 +922,10 @@ func ensureAlternatingRoles(history []any) []any {
 						curr.UserInputMessage.UserInputMessageContext.ToolResults...,
 					)
 				}
+				// Merge images
+				if len(curr.UserInputMessage.Images) > 0 {
+					prev.UserInputMessage.Images = append(prev.UserInputMessage.Images, curr.UserInputMessage.Images...)
+				}
 				result[len(result)-1] = prev
 			} else {
 				// Merge assistant messages
@@ -990,6 +1059,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 	} else {
 		cwReq.ConversationState.CurrentMessage.UserInputMessage.Content = getMessageContent(lastMsg.Content)
 	}
+	// Extract images from the last message and add to currentMessage
+	if imgs := extractImages(lastMsg.Content); len(imgs) > 0 {
+		cwReq.ConversationState.CurrentMessage.UserInputMessage.Images = imgs
+	}
 	// Map Anthropic model to CodeWhisperer model, fallback to "auto"
 	modelId := "auto"
 	if mappedModel, ok := ModelMap[anthropicReq.Model]; ok {
@@ -1073,6 +1146,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 		// 然后处理常规消息历史 - 确保严格交替 user/assistant
 		// CodeWhisperer要求历史记录必须是 user -> assistant -> user -> assistant 的顺序
 		var pendingUserContent []string
+		var pendingUserImages []KiroImage
 		for i := 0; i < len(anthropicReq.Messages)-1; i++ {
 			msg := anthropicReq.Messages[i]
 			if msg.Role == "user" {
@@ -1092,6 +1166,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					}
 					history = append(history, userMsg)
 					pendingUserContent = nil // Clear any pending content
+					pendingUserImages = nil
 
 					// Check if the NEXT message is also a user message (not assistant)
 					// This can happen when user provides tool_result then sends a new text message
@@ -1111,6 +1186,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 				if content != "" {
 					pendingUserContent = append(pendingUserContent, content)
 				}
+				if imgs := extractImages(msg.Content); len(imgs) > 0 {
+					pendingUserImages = append(pendingUserImages, imgs...)
+				}
 
 				// 检查下一条消息是否是助手回复
 				if i+1 < len(anthropicReq.Messages)-1 && anthropicReq.Messages[i+1].Role == "assistant" {
@@ -1123,7 +1201,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					// Include assistant message if it has text OR tool uses (matching kiro-cli behavior)
 					if assistantContent != "" || len(toolUses) > 0 {
 						// 添加合并的用户消息
-						if len(pendingUserContent) > 0 {
+						if len(pendingUserContent) > 0 || len(pendingUserImages) > 0 {
 							userMsg := HistoryUserMessage{}
 							userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
 							userMsg.UserInputMessage.Origin = "KIRO_CLI"
@@ -1133,8 +1211,12 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 									CurrentWorkingDirectory: cwd,
 								},
 							}
+							if len(pendingUserImages) > 0 {
+								userMsg.UserInputMessage.Images = pendingUserImages
+							}
 							history = append(history, userMsg)
 							pendingUserContent = nil // 清空
+							pendingUserImages = nil
 						}
 
 						assistantMsg := HistoryAssistantMessage{}
@@ -1201,7 +1283,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					}
 					
 					// Normal case: add pending user content first, then assistant
-					if len(pendingUserContent) > 0 {
+					if len(pendingUserContent) > 0 || len(pendingUserImages) > 0 {
 						userMsg := HistoryUserMessage{}
 						userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
 						userMsg.UserInputMessage.Origin = "KIRO_CLI"
@@ -1211,8 +1293,12 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 								CurrentWorkingDirectory: cwd,
 							},
 						}
+						if len(pendingUserImages) > 0 {
+							userMsg.UserInputMessage.Images = pendingUserImages
+						}
 						history = append(history, userMsg)
 						pendingUserContent = nil
+						pendingUserImages = nil
 					}
 
 					assistantMsg := HistoryAssistantMessage{}
@@ -1282,7 +1368,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 		// Note: We don't add a default assistant response here because that would be
 		// artificial content that the model might mimic. The pending user content
 		// will be part of the current request context instead.
-		if len(pendingUserContent) > 0 {
+		if len(pendingUserContent) > 0 || len(pendingUserImages) > 0 {
 			userMsg := HistoryUserMessage{}
 			userMsg.UserInputMessage.Content = strings.Join(pendingUserContent, "\n")
 			userMsg.UserInputMessage.Origin = "KIRO_CLI"
@@ -1291,6 +1377,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					OperatingSystem:         goosToQApi(runtime.GOOS),
 					CurrentWorkingDirectory: cwd,
 				},
+			}
+			if len(pendingUserImages) > 0 {
+				userMsg.UserInputMessage.Images = pendingUserImages
 			}
 			history = append(history, userMsg)
 		}
@@ -2275,8 +2364,6 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		http.Error(w, fmt.Sprintf("序列化请求失败: %v", err), http.StatusInternalServerError)
 		return
 	}
-
-	// fmt.Printf("CodeWhisperer 请求体:\n%s\n", string(cwReqBody))
 
 	// 创建请求 - 使用Q API endpoint (like kiro-cli)
 	proxyReq, err := http.NewRequest(
