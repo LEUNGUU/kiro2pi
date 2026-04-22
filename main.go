@@ -113,7 +113,7 @@ func getQApiEndpoint() string {
 	if region == "" {
 		region = "us-east-1"
 	}
-	return fmt.Sprintf("https://q.%s.amazonaws.com/", region)
+	return fmt.Sprintf("https://runtime.%s.kiro.dev/", region)
 }
 
 // getKiroCliDbPath 获取kiro-cli SQLite数据库路径
