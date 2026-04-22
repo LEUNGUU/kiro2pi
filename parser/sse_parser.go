@@ -45,7 +45,7 @@ func ParseEvents(resp []byte) []SSEEvent {
 	startedTools := make(map[string]bool)  // Track which tool_use IDs have been started
 	toolIndexMap := make(map[string]int)   // Map tool_use ID to its index
 	thinkingToolIds := make(map[string]bool) // Track which tool IDs are thinking tools
-	nextToolIndex := 2                     // Next available index for tools (0=thinking if present, 1=text)
+	nextToolIndex := 1                     // Next available index for tools (after text at 0; bumped to 2 if thinking appears)
 	lastContent := ""                      // Track last content for deduplication
 	hasThinking := false                   // Track if we've seen thinking blocks
 	textIndex := 0                         // Text index: 0 if no thinking, 1 if thinking present
@@ -372,6 +372,9 @@ func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools 
 			if !*hasThinking {
 				*hasThinking = true
 				*textIndex = 1 // Text will use index 1 since thinking uses index 0
+				if *nextToolIndex < 2 {
+					*nextToolIndex = 2
+				}
 			}
 		}
 		return convertThinkingToolToThinkingBlock(evt, startedTools, toolIndexMap, nextToolIndex, hasThinking)
@@ -408,6 +411,9 @@ func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools 
 			if tagResult.IsFirstChunk && !*hasThinking {
 				*hasThinking = true
 				*textIndex = 1
+				if *nextToolIndex < 2 {
+					*nextToolIndex = 2
+				}
 			}
 			events = append(events, emitThinkingEvents(tagResult, startedTools)...)
 		}
@@ -417,6 +423,18 @@ func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools 
 			events = append(events, emitTextEvents(tagResult.RegularContent, startedTools, *textIndex)...)
 		}
 	} else if evt.ToolUseId != "" && evt.Name != "" && !evt.Stop {
+		// Ensure text block is emitted before any tool_use block so indices are sequential
+		if !startedTools["__text__"] {
+			startedTools["__text__"] = true
+			events = append(events, SSEEvent{
+				Event: "content_block_start",
+				Data: map[string]interface{}{
+					"type":  "content_block_start",
+					"index": *textIndex,
+					"content_block": map[string]interface{}{"type": "text", "text": ""},
+				},
+			})
+		}
 		// Get or assign index for this tool
 		toolIndex, exists := toolIndexMap[evt.ToolUseId]
 		if !exists {
@@ -505,7 +523,7 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 	startedTools := make(map[string]bool)
 	toolIndexMap := make(map[string]int)
 	thinkingToolIds := make(map[string]bool)
-	nextToolIndex := 2      // Next available index for tools (0=thinking if present, 1=text)
+	nextToolIndex := 1      // Next available index for tools (after text at 0; bumped to 2 if thinking appears)
 	lastContent := ""
 	hasThinking := false    // Track if we've seen thinking blocks
 	textIndex := 0          // Text index: 0 if no thinking, 1 if thinking present

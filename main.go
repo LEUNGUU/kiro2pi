@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"database/sql"
 	"encoding/json"
@@ -423,7 +424,7 @@ type AnthropicRequest struct {
 	Model       string                    `json:"model"`
 	MaxTokens   int                       `json:"max_tokens"`
 	Messages    []AnthropicRequestMessage `json:"messages"`
-	System      []AnthropicSystemMessage  `json:"system,omitempty"`
+	System      FlexibleSystem            `json:"system,omitempty"`
 	Tools       []AnthropicTool           `json:"tools,omitempty"`
 	Stream      bool                      `json:"stream"`
 	Temperature *float64                  `json:"temperature,omitempty"`
@@ -460,6 +461,25 @@ type AnthropicRequestMessage struct {
 type AnthropicSystemMessage struct {
 	Type string `json:"type"`
 	Text string `json:"text"` // 可以是 string 或 []ContentBlock
+}
+
+// FlexibleSystem handles Anthropic system field being either a string or []AnthropicSystemMessage
+type FlexibleSystem []AnthropicSystemMessage
+
+func (fs *FlexibleSystem) UnmarshalJSON(data []byte) error {
+	// Try string first
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*fs = []AnthropicSystemMessage{{Type: "text", Text: s}}
+		return nil
+	}
+	// Otherwise treat as array
+	var msgs []AnthropicSystemMessage
+	if err := json.Unmarshal(data, &msgs); err != nil {
+		return err
+	}
+	*fs = msgs
+	return nil
 }
 
 // ContentBlock 表示消息内容块的结构
@@ -742,10 +762,20 @@ var ModelMap = map[string]string{
 	"claude-haiku-4.5":          "claude-haiku-4.5",
 	"claude-opus-4.5":           "claude-opus-4.5",
 	"claude-opus-4.6":           "claude-opus-4.6",
+	"claude-opus-4.7":           "claude-opus-4.7",
 	"claude-sonnet-4.6":         "claude-sonnet-4.6",
 	"deepseek-3.2":              "deepseek-3.2",
 	"minimax-m2.5":              "minimax-m2.5",
 	"glm-5":                     "glm-5",
+	// Anthropic SDK normalizes dots to hyphens in model names
+	"claude-sonnet-4-5":         "claude-sonnet-4.5",
+	"claude-haiku-4-5":          "claude-haiku-4.5",
+	"claude-opus-4-5":           "claude-opus-4.5",
+	"claude-opus-4-6":           "claude-opus-4.6",
+	"claude-opus-4-7":           "claude-opus-4.7",
+	"claude-sonnet-4-6":         "claude-sonnet-4.6",
+	"deepseek-3-2":              "deepseek-3.2",
+	"minimax-m2-5":              "minimax-m2.5",
 }
 
 // generateUUID generates a simple UUID v4
@@ -1096,7 +1126,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 
 	// Add thinking tool when thinking is enabled (matching kiro-cli behavior)
 	// The Q API implements thinking as a tool, not as a native parameter
-	if anthropicReq.Thinking != nil && anthropicReq.Thinking.Type == "enabled" {
+	if anthropicReq.Thinking != nil && (anthropicReq.Thinking.Type == "enabled" || anthropicReq.Thinking.Type == "adaptive") {
 		log.Printf("Thinking enabled with budget_tokens=%d, adding thinking tool", anthropicReq.Thinking.BudgetTokens)
 		thinkingTool := CodeWhispererTool{}
 		thinkingTool.ToolSpecification.Name = "thinking"
@@ -1876,6 +1906,147 @@ func getToken() (TokenData, error) {
 }
 
 // logMiddleware 记录所有HTTP请求的中间件
+// oaiNonStreamHandler handles OpenAI-format non-streaming requests
+func oaiNonStreamHandler(w http.ResponseWriter, anthropicReq AnthropicRequest, accessToken string) {
+	// Use a ResponseRecorder to capture the Anthropic response
+	rec := &responseRecorder{headers: make(http.Header), body: &bytes.Buffer{}}
+	handleNonStreamRequest(rec, anthropicReq, accessToken)
+
+	if rec.code != http.StatusOK && rec.code != 0 {
+		w.WriteHeader(rec.code)
+		w.Write(rec.body.Bytes())
+		return
+	}
+
+	// Parse Anthropic response
+	var anthResp struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		Model      string `json:"model"`
+		StopReason string `json:"stop_reason"`
+		Usage      struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(rec.body.Bytes(), &anthResp); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"parse response: %v"}}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	// Build text from content blocks
+	var text string
+	for _, c := range anthResp.Content {
+		if c.Type == "text" {
+			text += c.Text
+		}
+	}
+
+	// Convert to OpenAI format
+	oaiResp := map[string]any{
+		"id":      "chatcmpl-kiro2pi",
+		"object":  "chat.completion",
+		"model":   anthResp.Model,
+		"choices": []map[string]any{{
+			"index": 0,
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": text,
+			},
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]any{
+			"prompt_tokens":     anthResp.Usage.InputTokens,
+			"completion_tokens": anthResp.Usage.OutputTokens,
+			"total_tokens":      anthResp.Usage.InputTokens + anthResp.Usage.OutputTokens,
+		},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(oaiResp)
+}
+
+// oaiStreamHandler handles OpenAI-format streaming requests
+func oaiStreamHandler(w http.ResponseWriter, anthropicReq AnthropicRequest, accessToken string) {
+	// Use a pipe to capture SSE from the Anthropic handler
+	pr, pw := io.Pipe()
+	rec := &responseRecorder{headers: make(http.Header), body: nil, pipe: pw}
+
+	go func() {
+		handleStreamRequest(rec, anthropicReq, accessToken)
+		pw.Close()
+	}()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	scanner := bufio.NewScanner(pr)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			break
+		}
+		var evt map[string]any
+		if err := json.Unmarshal([]byte(data), &evt); err != nil {
+			continue
+		}
+		evtType, _ := evt["type"].(string)
+		switch evtType {
+		case "content_block_delta":
+			delta, _ := evt["delta"].(map[string]any)
+			text, _ := delta["text"].(string)
+			if text != "" {
+				chunk := map[string]any{
+					"id": "chatcmpl-kiro2pi", "object": "chat.completion.chunk", "model": anthropicReq.Model,
+					"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": text}}},
+				}
+				b, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", b)
+				flusher.Flush()
+			}
+		case "message_stop":
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// responseRecorder captures HTTP response for format conversion
+type responseRecorder struct {
+	headers http.Header
+	body    *bytes.Buffer
+	pipe    *io.PipeWriter
+	code    int
+}
+
+func (r *responseRecorder) Header() http.Header { return r.headers }
+func (r *responseRecorder) WriteHeader(code int) { r.code = code }
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	if r.pipe != nil {
+		return r.pipe.Write(b)
+	}
+	if r.body == nil {
+		r.body = &bytes.Buffer{}
+	}
+	return r.body.Write(b)
+}
+func (r *responseRecorder) Flush() {
+	// no-op for recorder; real flushing happens on the outer writer
+}
+
 func logMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
@@ -1931,6 +2102,7 @@ func startServer(port string) {
 		defer r.Body.Close()
 
 		fmt.Printf("\n=========================Anthropic 请求体:\n%s\n=======================================\n", string(body))
+		os.WriteFile("/tmp/kiro2pi_last_request.json", body, 0644)
 
 		// 解析 Anthropic 请求
 		var anthropicReq AnthropicRequest
@@ -1969,6 +2141,195 @@ func startServer(port string) {
 		handleNonStreamRequest(w, anthropicReq, token.AccessToken)
 	}))
 
+	// OpenAI-compatible /v1/chat/completions endpoint
+	mux.HandleFunc("/v1/chat/completions", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+			return
+		}
+		token, err := getToken()
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusInternalServerError)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusInternalServerError)
+			return
+		}
+		defer r.Body.Close()
+
+		// Parse OpenAI request
+		var oaiReq struct {
+			Model       string     `json:"model"`
+			Messages    []struct {
+				Role    string `json:"role"`
+				Content any    `json:"content"`
+			} `json:"messages"`
+			MaxTokens   int        `json:"max_tokens"`
+			Temperature *float64   `json:"temperature,omitempty"`
+			Stream      bool       `json:"stream"`
+		}
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusBadRequest)
+			return
+		}
+
+		// Convert to AnthropicRequest
+		var systemMsgs FlexibleSystem
+		var chatMsgs []AnthropicRequestMessage
+		for _, m := range oaiReq.Messages {
+			if m.Role == "system" {
+				text := ""
+				switch v := m.Content.(type) {
+				case string:
+					text = v
+				default:
+					b, _ := json.Marshal(v)
+					text = string(b)
+				}
+				systemMsgs = append(systemMsgs, AnthropicSystemMessage{Type: "text", Text: text})
+			} else {
+				chatMsgs = append(chatMsgs, AnthropicRequestMessage{Role: m.Role, Content: m.Content})
+			}
+		}
+		maxTok := oaiReq.MaxTokens
+		if maxTok == 0 {
+			maxTok = 4096
+		}
+		anthropicReq := AnthropicRequest{
+			Model:       oaiReq.Model,
+			Messages:    chatMsgs,
+			System:      systemMsgs,
+			MaxTokens:   maxTok,
+			Temperature: oaiReq.Temperature,
+			Stream:      false, // always non-stream, convert below if needed
+		}
+
+		if _, ok := ModelMap[anthropicReq.Model]; !ok {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"Unknown model: %s"}}`, anthropicReq.Model), http.StatusBadRequest)
+			return
+		}
+
+		fmt.Printf("\n[OpenAI compat] model=%s messages=%d stream=%v\n", oaiReq.Model, len(oaiReq.Messages), oaiReq.Stream)
+
+		if oaiReq.Stream {
+			// Stream: pipe through Anthropic handler, convert SSE format
+			anthropicReq.Stream = true
+			oaiStreamHandler(w, anthropicReq, token.AccessToken)
+		} else {
+			// Non-stream: capture Anthropic response, convert to OpenAI format
+			oaiNonStreamHandler(w, anthropicReq, token.AccessToken)
+		}
+	}))
+
+	// OpenAI legacy /v1/completions endpoint (adapter for topic-classifier etc.)
+	mux.HandleFunc("/v1/completions", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+			return
+		}
+		token, err := getToken()
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusInternalServerError)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusInternalServerError)
+			return
+		}
+		defer r.Body.Close()
+
+		var legacyReq struct {
+			Model       string   `json:"model"`
+			Prompt      any      `json:"prompt"`
+			MaxTokens   int      `json:"max_tokens"`
+			Temperature *float64 `json:"temperature,omitempty"`
+			Stream      bool     `json:"stream"`
+		}
+		if err := json.Unmarshal(body, &legacyReq); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusBadRequest)
+			return
+		}
+
+		// Convert prompt to string
+		var promptText string
+		switch v := legacyReq.Prompt.(type) {
+		case string:
+			promptText = v
+		default:
+			b, _ := json.Marshal(v)
+			promptText = string(b)
+		}
+
+		if _, ok := ModelMap[legacyReq.Model]; !ok {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"Unknown model: %s"}}`, legacyReq.Model), http.StatusBadRequest)
+			return
+		}
+
+		maxTok := legacyReq.MaxTokens
+		if maxTok == 0 {
+			maxTok = 4096
+		}
+		anthropicReq := AnthropicRequest{
+			Model:       legacyReq.Model,
+			Messages:    []AnthropicRequestMessage{{Role: "user", Content: promptText}},
+			MaxTokens:   maxTok,
+			Temperature: legacyReq.Temperature,
+			Stream:      false,
+		}
+
+		fmt.Printf("\n[OpenAI legacy completions] model=%s prompt_len=%d stream=%v\n", legacyReq.Model, len(promptText), legacyReq.Stream)
+
+		// Call Anthropic, return in legacy completions format
+		rec := &responseRecorder{headers: make(http.Header), body: &bytes.Buffer{}}
+		handleNonStreamRequest(rec, anthropicReq, token.AccessToken)
+		if rec.code != http.StatusOK && rec.code != 0 {
+			w.WriteHeader(rec.code)
+			w.Write(rec.body.Bytes())
+			return
+		}
+		var anthResp struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+			Model      string `json:"model"`
+			Usage      struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(rec.body.Bytes(), &anthResp); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"parse response: %v"}}`, err), http.StatusInternalServerError)
+			return
+		}
+		var text string
+		for _, c := range anthResp.Content {
+			if c.Type == "text" {
+				text += c.Text
+			}
+		}
+		resp := map[string]any{
+			"id":     "cmpl-kiro2pi",
+			"object": "text_completion",
+			"model":  anthResp.Model,
+			"choices": []map[string]any{{
+				"text":          text,
+				"index":         0,
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]any{
+				"prompt_tokens":     anthResp.Usage.InputTokens,
+				"completion_tokens": anthResp.Usage.OutputTokens,
+				"total_tokens":      anthResp.Usage.InputTokens + anthResp.Usage.OutputTokens,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+
 	// 添加 /v1/models 端点
 	mux.HandleFunc("/v1/models", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1981,6 +2342,7 @@ func startServer(port string) {
 			{"id": "claude-haiku-4.5", "type": "model", "display_name": "Claude Haiku 4.5", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "claude-opus-4.5", "type": "model", "display_name": "Claude Opus 4.5", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "claude-opus-4.6", "type": "model", "display_name": "Claude Opus 4.6", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "claude-opus-4.7", "type": "model", "display_name": "Claude Opus 4.7", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "claude-sonnet-4.6", "type": "model", "display_name": "Claude Sonnet 4.6", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "deepseek-3.2", "type": "model", "display_name": "DeepSeek 3.2", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "minimax-m2.5", "type": "model", "display_name": "MiniMax M2.5", "created_at": "2025-01-01T00:00:00Z"},
@@ -2004,7 +2366,7 @@ func startServer(port string) {
 
 	// 添加404处理
 	mux.HandleFunc("/", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Printf("警告: 访问未知端点\n")
+		fmt.Printf("警告: 访问未知端点 %s %s\n", r.Method, r.URL.Path)
 		http.Error(w, "404 未找到", http.StatusNotFound)
 	}))
 
@@ -2311,6 +2673,22 @@ processResponse:
 			parseResult = parser.ParseEventsWithThinking(contRespBody)
 			log.Printf("Continuation %d: events=%d, thinking=%s, hasRegularTools=%v",
 				continuationCount, len(parseResult.Events), parseResult.ThinkingToolId, parseResult.HasRegularTools)
+
+			// Fix indices: continuation parser starts textIndex at 0, but the
+			// first parse already emitted thinking at index 0, so all content
+			// block indices must be shifted by the offset.
+			if textIndex > 0 {
+				offset := textIndex // e.g. 1 when thinking used index 0
+				for i := range parseResult.Events {
+					if dataMap, ok := parseResult.Events[i].Data.(map[string]interface{}); ok {
+						if idx, ok := dataMap["index"].(int); ok {
+							dataMap["index"] = idx + offset
+						} else if idx, ok := dataMap["index"].(float64); ok {
+							dataMap["index"] = int(idx) + offset
+						}
+					}
+				}
+			}
 
 			// Continue to next iteration to process continuation events
 			continue
