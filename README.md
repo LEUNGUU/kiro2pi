@@ -9,20 +9,27 @@ A proxy server that enables [pi-coding-agent](https://github.com/badlogic/pi-mon
 │ pi-coding-agent │────▶│   kiro2pi   │────▶│  CodeWhisperer   │
 │  (Anthropic API)│     │   (proxy)   │     │    (Q API)       │
 └─────────────────┘     └─────────────┘     └──────────────────┘
+
+┌─────────────────┐     ┌─────────────┐     ┌──────────────────┐
+│  OpenAI client  │────▶│   kiro2pi   │────▶│  CodeWhisperer   │
+│ (OpenAI API)    │     │   (proxy)   │     │    (Q API)       │
+└─────────────────┘     └─────────────┘     └──────────────────┘
 ```
 
-kiro2pi translates Anthropic API requests to CodeWhisperer Q API format, allowing you to use pi-coding-agent with your Kiro/CodeWhisperer subscription.
+kiro2pi translates Anthropic and OpenAI API requests to CodeWhisperer Q API format, allowing you to use pi-coding-agent or any OpenAI-compatible client with your Kiro/CodeWhisperer subscription.
 
 ## Features
 
 - Anthropic Messages API compatible proxy
+- OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/completions`)
 - Automatic token management (reads from kiro-cli)
-- Streaming support
+- Streaming support (both Anthropic SSE and OpenAI SSE formats)
 - Tool use / function calling support
-- Extended thinking support (via thinking tool)
+- Extended thinking support (enabled and adaptive, via thinking tool)
 - Automatic token refresh on 403 errors
 - Retry with exponential backoff for rate limits
 - Image/multimodal support (base64 PNG, JPEG, WebP, GIF)
+- Hyphenated model name aliases (e.g. `claude-opus-4-7` → `claude-opus-4.7`)
 
 ## Prerequisites
 
@@ -72,20 +79,20 @@ Add to `~/.pi/agent/models.json`:
       "api": "anthropic-messages",
       "models": [
         {
-          "id": "claude-opus-4.5",
-          "name": "Claude Opus 4.5 (Kiro)",
+          "id": "claude-opus-4.7",
+          "name": "Claude Opus 4.7 (Kiro)",
           "reasoning": true,
           "input": ["text", "image"],
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "cost": { "input": 33, "output": 33, "cacheRead": 0, "cacheWrite": 0 },
           "contextWindow": 128000,
-          "maxTokens": 64000
+          "maxTokens": 128000
         },
         {
           "id": "claude-sonnet-4.5",
           "name": "Claude Sonnet 4.5 (Kiro)",
           "reasoning": true,
           "input": ["text", "image"],
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "cost": { "input": 19.5, "output": 19.5, "cacheRead": 0, "cacheWrite": 0 },
           "contextWindow": 128000,
           "maxTokens": 64000
         }
@@ -177,16 +184,32 @@ The proxy maps model names to CodeWhisperer models:
 
 | Request Model | CodeWhisperer Model |
 |---------------|---------------------|
-| `claude-opus-4.5` | `claude-opus-4.5` |
+| `claude-opus-4.7` | `claude-opus-4.7` |
 | `claude-opus-4.6` | `claude-opus-4.6` |
-| `claude-sonnet-4.5` | `claude-sonnet-4.5` |
+| `claude-opus-4.5` | `claude-opus-4.5` |
 | `claude-sonnet-4.6` | `claude-sonnet-4.6` |
+| `claude-sonnet-4.5` | `claude-sonnet-4.5` |
 | `claude-sonnet-4` | `claude-sonnet-4` |
 | `claude-haiku-4.5` | `claude-haiku-4.5` |
+| `deepseek-3.2` | `deepseek-3.2` |
+| `minimax-m2.5` | `minimax-m2.5` |
+| `glm-5` | `glm-5` |
+
+Hyphenated aliases are also supported (e.g. `claude-opus-4-7` → `claude-opus-4.7`).
+
+## API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/messages` | Anthropic Messages API (main endpoint) |
+| `POST /v1/chat/completions` | OpenAI Chat Completions API (streaming & non-streaming) |
+| `POST /v1/completions` | OpenAI legacy Completions API |
+| `GET /v1/models` | List available models |
+| `GET /health` | Health check |
 
 ## Known Limitations
 
-- Context window is limited by CodeWhisperer (use 128K in config to be safe)
+- Q API has a ~590KB request payload hard limit, which caps effective context at ~128K tokens (set `contextWindow: 128000` in models.json)
 - Input token counts are estimated (chars/4 heuristic)
 - URL-based image sources are not supported (only base64)
 
