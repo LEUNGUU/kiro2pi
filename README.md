@@ -206,6 +206,41 @@ Hyphenated aliases are also supported (e.g. `claude-opus-4-7` → `claude-opus-4
 | `POST /v1/completions` | OpenAI legacy Completions API |
 | `GET /v1/models` | List available models |
 | `GET /health` | Health check |
+| `GET /stats` | Call statistics (aggregated by model/day) |
+| `GET /logs` | Call log entries (paginated) |
+
+## Observability
+
+Every LLM call is automatically logged to a local SQLite database at `~/.kiro2pi/observability.db`.
+
+### What's recorded
+
+| Field | Description |
+|-------|-------------|
+| `model` | Requested model name |
+| `endpoint` | `/v1/messages` or `/v1/chat/completions` |
+| `stream` | Whether the request was streaming |
+| `latency_ms` | End-to-end request latency |
+| `ttft_ms` | Time to first token (streaming only) |
+| `status_code` | HTTP response status |
+| `request_hash` | SHA256 of request body (for dedup, no raw content stored) |
+| `has_tools` | Whether the request included tool definitions |
+| `has_thinking` | Whether extended thinking was enabled |
+
+### Query endpoints
+
+```bash
+# Stats aggregated by model and day
+curl http://localhost:9090/stats
+curl "http://localhost:9090/stats?model=claude-opus-4.7"
+curl "http://localhost:9090/stats?since=2026-04-01"
+
+# Paginated call logs
+curl http://localhost:9090/logs
+curl "http://localhost:9090/logs?limit=20&offset=0"
+```
+
+No full request/response bodies are stored. Use `DEBUG_SAVE_RAW=1` for raw response debugging.
 
 ## Known Limitations
 
