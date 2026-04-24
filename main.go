@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,11 +15,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bestk/kiro2cc/parser"
+	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
 
@@ -40,6 +44,115 @@ const (
 	maxRequestBytes        = 590 * 1024 // 590KB max request payload (Kiro API hard limit is ~615KB)
 	maxToolResultContentLen = 10 * 1024  // 10KB max per tool result content
 )
+
+// Observability database
+var observDB *sql.DB
+
+func initObservabilityDB() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(home, ".kiro2pi")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, "observability.db"))
+	if err != nil {
+		return err
+	}
+	db.Exec("PRAGMA journal_mode=WAL")
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS call_log (
+		id TEXT PRIMARY KEY,
+		created_at TEXT NOT NULL,
+		model TEXT NOT NULL,
+		endpoint TEXT NOT NULL,
+		stream INTEGER NOT NULL,
+		input_tokens INTEGER,
+		output_tokens INTEGER,
+		latency_ms INTEGER NOT NULL,
+		ttft_ms INTEGER,
+		status_code INTEGER NOT NULL,
+		error_message TEXT,
+		request_hash TEXT,
+		has_tools INTEGER DEFAULT 0,
+		has_thinking INTEGER DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS idx_call_log_created ON call_log(created_at);
+	CREATE INDEX IF NOT EXISTS idx_call_log_model ON call_log(model);`)
+	if err != nil {
+		db.Close()
+		return err
+	}
+	observDB = db
+	return nil
+}
+
+// observWriter wraps ResponseWriter to capture status code and time-to-first-byte
+type observWriter struct {
+	http.ResponseWriter
+	statusCode int
+	firstWrite time.Time
+	startTime  time.Time
+	wroteOnce  bool
+}
+
+func (w *observWriter) WriteHeader(code int) {
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *observWriter) Write(b []byte) (int, error) {
+	if !w.wroteOnce {
+		w.wroteOnce = true
+		w.firstWrite = time.Now()
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *observWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func logCall(endpoint string, body []byte, anthropicReq AnthropicRequest, stream bool, ow *observWriter) {
+	if observDB == nil {
+		return
+	}
+	latency := time.Since(ow.startTime).Milliseconds()
+	var ttft *int64
+	if stream && ow.wroteOnce {
+		v := ow.firstWrite.Sub(ow.startTime).Milliseconds()
+		ttft = &v
+	}
+	statusCode := ow.statusCode
+	if statusCode == 0 {
+		statusCode = 200
+	}
+	hash := sha256.Sum256(body)
+	hasTools := 0
+	if len(anthropicReq.Tools) > 0 {
+		hasTools = 1
+	}
+	hasThinking := 0
+	if anthropicReq.Thinking != nil && (anthropicReq.Thinking.Type == "enabled" || anthropicReq.Thinking.Type == "adaptive") {
+		hasThinking = 1
+	}
+	streamInt := 0
+	if stream {
+		streamInt = 1
+	}
+	go func() {
+		_, err := observDB.Exec(
+			`INSERT INTO call_log (id,created_at,model,endpoint,stream,latency_ms,ttft_ms,status_code,request_hash,has_tools,has_thinking) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			uuid.New().String(), time.Now().UTC().Format(time.RFC3339), anthropicReq.Model, endpoint, streamInt, latency, ttft, statusCode, hex.EncodeToString(hash[:]), hasTools, hasThinking,
+		)
+		if err != nil {
+			log.Printf("observability: insert error: %v", err)
+		}
+	}()
+}
 
 // isRetryableStatusCode checks if the HTTP status code is retryable
 func isRetryableStatusCode(statusCode int) bool {
@@ -2072,6 +2185,11 @@ func logMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 // startServer 启动HTTP代理服务器
 func startServer(port string) {
+	// Initialize observability database
+	if err := initObservabilityDB(); err != nil {
+		log.Printf("Warning: observability DB init failed: %v", err)
+	}
+
 	// 创建路由器
 	mux := http.NewServeMux()
 
@@ -2132,13 +2250,16 @@ func startServer(port string) {
 		}
 
 		// 如果是流式请求
+		ow := &observWriter{ResponseWriter: w, startTime: time.Now()}
 		if anthropicReq.Stream {
-			handleStreamRequest(w, anthropicReq, token.AccessToken)
+			handleStreamRequest(ow, anthropicReq, token.AccessToken)
+			logCall("/v1/messages", body, anthropicReq, true, ow)
 			return
 		}
 
 		// 非流式请求处理
-		handleNonStreamRequest(w, anthropicReq, token.AccessToken)
+		handleNonStreamRequest(ow, anthropicReq, token.AccessToken)
+		logCall("/v1/messages", body, anthropicReq, false, ow)
 	}))
 
 	// OpenAI-compatible /v1/chat/completions endpoint
@@ -2213,13 +2334,16 @@ func startServer(port string) {
 
 		fmt.Printf("\n[OpenAI compat] model=%s messages=%d stream=%v\n", oaiReq.Model, len(oaiReq.Messages), oaiReq.Stream)
 
+		ow := &observWriter{ResponseWriter: w, startTime: time.Now()}
 		if oaiReq.Stream {
 			// Stream: pipe through Anthropic handler, convert SSE format
 			anthropicReq.Stream = true
-			oaiStreamHandler(w, anthropicReq, token.AccessToken)
+			oaiStreamHandler(ow, anthropicReq, token.AccessToken)
+			logCall("/v1/chat/completions", body, anthropicReq, true, ow)
 		} else {
 			// Non-stream: capture Anthropic response, convert to OpenAI format
-			oaiNonStreamHandler(w, anthropicReq, token.AccessToken)
+			oaiNonStreamHandler(ow, anthropicReq, token.AccessToken)
+			logCall("/v1/chat/completions", body, anthropicReq, false, ow)
 		}
 	}))
 
@@ -2358,6 +2482,112 @@ func startServer(port string) {
 		json.NewEncoder(w).Encode(resp)
 	}))
 
+	// Observability: /stats endpoint
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		if observDB == nil {
+			http.Error(w, `{"error":"observability not initialized"}`, http.StatusServiceUnavailable)
+			return
+		}
+		model := r.URL.Query().Get("model")
+		since := r.URL.Query().Get("since")
+		query := `SELECT model, DATE(created_at) as day, COUNT(*) as calls, SUM(input_tokens) as input_tok, SUM(output_tokens) as output_tok, AVG(latency_ms) as avg_latency, AVG(ttft_ms) as avg_ttft FROM call_log WHERE 1=1`
+		var args []any
+		if model != "" {
+			query += " AND model=?"
+			args = append(args, model)
+		}
+		if since != "" {
+			query += " AND created_at>=?"
+			args = append(args, since)
+		}
+		query += " GROUP BY model, day ORDER BY day DESC"
+		rows, err := observDB.Query(query, args...)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%v"}`, err), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		var results []map[string]any
+		for rows.Next() {
+			var m, day string
+			var calls int
+			var inputTok, outputTok sql.NullInt64
+			var avgLatency, avgTtft sql.NullFloat64
+			rows.Scan(&m, &day, &calls, &inputTok, &outputTok, &avgLatency, &avgTtft)
+			results = append(results, map[string]any{
+				"model": m, "day": day, "calls": calls,
+				"input_tokens": inputTok.Int64, "output_tokens": outputTok.Int64,
+				"avg_latency_ms": avgLatency.Float64, "avg_ttft_ms": avgTtft.Float64,
+			})
+		}
+		if results == nil {
+			results = []map[string]any{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(results)
+	})
+
+	// Observability: /logs endpoint
+	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+		if observDB == nil {
+			http.Error(w, `{"error":"observability not initialized"}`, http.StatusServiceUnavailable)
+			return
+		}
+		limit := 50
+		offset := 0
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
+				limit = n
+			}
+		}
+		if v := r.URL.Query().Get("offset"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				offset = n
+			}
+		}
+		rows, err := observDB.Query(
+			`SELECT id,created_at,model,endpoint,stream,input_tokens,output_tokens,latency_ms,ttft_ms,status_code,error_message,request_hash,has_tools,has_thinking FROM call_log ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+			limit, offset,
+		)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%v"}`, err), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		var results []map[string]any
+		for rows.Next() {
+			var id, createdAt, model, endpoint, reqHash string
+			var stream, statusCode, hasTools, hasThinking int
+			var inputTok, outputTok, latency sql.NullInt64
+			var ttft sql.NullInt64
+			var errMsg sql.NullString
+			rows.Scan(&id, &createdAt, &model, &endpoint, &stream, &inputTok, &outputTok, &latency, &ttft, &statusCode, &errMsg, &reqHash, &hasTools, &hasThinking)
+			entry := map[string]any{
+				"id": id, "created_at": createdAt, "model": model, "endpoint": endpoint,
+				"stream": stream == 1, "latency_ms": latency.Int64, "status_code": statusCode,
+				"request_hash": reqHash, "has_tools": hasTools == 1, "has_thinking": hasThinking == 1,
+			}
+			if inputTok.Valid {
+				entry["input_tokens"] = inputTok.Int64
+			}
+			if outputTok.Valid {
+				entry["output_tokens"] = outputTok.Int64
+			}
+			if ttft.Valid {
+				entry["ttft_ms"] = ttft.Int64
+			}
+			if errMsg.Valid {
+				entry["error_message"] = errMsg.String
+			}
+			results = append(results, entry)
+		}
+		if results == nil {
+			results = []map[string]any{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(results)
+	})
+
 	// 添加健康检查端点
 	mux.HandleFunc("/health", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -2376,6 +2606,8 @@ func startServer(port string) {
 	fmt.Printf("  POST /v1/messages - Anthropic API代理\n")
 	fmt.Printf("  GET  /v1/models   - 获取可用模型列表\n")
 	fmt.Printf("  GET  /health      - 健康检查\n")
+	fmt.Printf("  GET  /stats       - 调用统计\n")
+	fmt.Printf("  GET  /logs        - 调用日志\n")
 	fmt.Printf("按Ctrl+C停止服务器\n")
 
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
