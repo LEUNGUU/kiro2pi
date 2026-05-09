@@ -2034,8 +2034,11 @@ func oaiNonStreamHandler(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 	// Parse Anthropic response
 	var anthResp struct {
 		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type  string         `json:"type"`
+			Text  string         `json:"text,omitempty"`
+			ID    string         `json:"id,omitempty"`
+			Name  string         `json:"name,omitempty"`
+			Input map[string]any `json:"input,omitempty"`
 		} `json:"content"`
 		Model      string `json:"model"`
 		StopReason string `json:"stop_reason"`
@@ -2049,26 +2052,45 @@ func oaiNonStreamHandler(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 		return
 	}
 
-	// Build text from content blocks
+	// Build text and tool_calls from content blocks
 	var text string
+	var toolCalls []map[string]any
 	for _, c := range anthResp.Content {
-		if c.Type == "text" {
+		switch c.Type {
+		case "text":
 			text += c.Text
+		case "tool_use":
+			args, _ := json.Marshal(c.Input)
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   c.ID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      c.Name,
+					"arguments": string(args),
+				},
+			})
 		}
 	}
 
 	// Convert to OpenAI format
+	finishReason := "stop"
+	msg := map[string]any{"role": "assistant", "content": text}
+	if len(toolCalls) > 0 {
+		msg["tool_calls"] = toolCalls
+		finishReason = "tool_calls"
+		if text == "" {
+			msg["content"] = nil
+		}
+	}
+
 	oaiResp := map[string]any{
 		"id":      "chatcmpl-kiro2pi",
 		"object":  "chat.completion",
 		"model":   anthResp.Model,
 		"choices": []map[string]any{{
-			"index": 0,
-			"message": map[string]any{
-				"role":    "assistant",
-				"content": text,
-			},
-			"finish_reason": "stop",
+			"index":         0,
+			"message":       msg,
+			"finish_reason": finishReason,
 		}},
 		"usage": map[string]any{
 			"prompt_tokens":     anthResp.Usage.InputTokens,
@@ -2101,6 +2123,8 @@ func oaiStreamHandler(w http.ResponseWriter, anthropicReq AnthropicRequest, acce
 	w.Header().Set("Connection", "keep-alive")
 
 	scanner := bufio.NewScanner(pr)
+	toolCallIndex := 0 // Track OpenAI tool_call index
+	currentBlockIsToolUse := false
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -2118,18 +2142,79 @@ func oaiStreamHandler(w http.ResponseWriter, anthropicReq AnthropicRequest, acce
 		}
 		evtType, _ := evt["type"].(string)
 		switch evtType {
-		case "content_block_delta":
-			delta, _ := evt["delta"].(map[string]any)
-			text, _ := delta["text"].(string)
-			if text != "" {
+		case "content_block_start":
+			cb, _ := evt["content_block"].(map[string]any)
+			currentBlockIsToolUse = cb != nil && cb["type"] == "tool_use"
+			if currentBlockIsToolUse {
+				tcDelta := map[string]any{
+					"index": toolCallIndex,
+					"id":    cb["id"],
+					"type":  "function",
+					"function": map[string]any{
+						"name":      cb["name"],
+						"arguments": "",
+					},
+				}
 				chunk := map[string]any{
 					"id": "chatcmpl-kiro2pi", "object": "chat.completion.chunk", "model": anthropicReq.Model,
-					"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": text}}},
+					"choices": []map[string]any{{"index": 0, "delta": map[string]any{"tool_calls": []map[string]any{tcDelta}}}},
 				}
 				b, _ := json.Marshal(chunk)
 				fmt.Fprintf(w, "data: %s\n\n", b)
 				flusher.Flush()
 			}
+		case "content_block_delta":
+			delta, _ := evt["delta"].(map[string]any)
+			deltaType, _ := delta["type"].(string)
+			switch deltaType {
+			case "text_delta":
+				text, _ := delta["text"].(string)
+				if text != "" {
+					chunk := map[string]any{
+						"id": "chatcmpl-kiro2pi", "object": "chat.completion.chunk", "model": anthropicReq.Model,
+						"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": text}}},
+					}
+					b, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", b)
+					flusher.Flush()
+				}
+			case "input_json_delta":
+				partialJSON, _ := delta["partial_json"].(string)
+				if partialJSON != "" {
+					chunk := map[string]any{
+						"id": "chatcmpl-kiro2pi", "object": "chat.completion.chunk", "model": anthropicReq.Model,
+						"choices": []map[string]any{{"index": 0, "delta": map[string]any{
+							"tool_calls": []map[string]any{{
+								"index":    toolCallIndex,
+								"function": map[string]any{"arguments": partialJSON},
+							}},
+						}}},
+					}
+					b, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", b)
+					flusher.Flush()
+				}
+			}
+		case "content_block_stop":
+			if currentBlockIsToolUse {
+				toolCallIndex++
+				currentBlockIsToolUse = false
+			}
+		case "message_delta":
+			// Send finish_reason based on stop_reason
+			md, _ := evt["delta"].(map[string]any)
+			stopReason, _ := md["stop_reason"].(string)
+			finishReason := "stop"
+			if stopReason == "tool_use" {
+				finishReason = "tool_calls"
+			}
+			chunk := map[string]any{
+				"id": "chatcmpl-kiro2pi", "object": "chat.completion.chunk", "model": anthropicReq.Model,
+				"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason}},
+			}
+			b, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
 		case "message_stop":
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
@@ -2282,14 +2367,32 @@ func startServer(port string) {
 
 		// Parse OpenAI request
 		var oaiReq struct {
-			Model       string     `json:"model"`
-			Messages    []struct {
-				Role    string `json:"role"`
-				Content any    `json:"content"`
+			Model    string `json:"model"`
+			Messages []struct {
+				Role       string `json:"role"`
+				Content    any    `json:"content"`
+				ToolCalls  []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls,omitempty"`
+				ToolCallID string `json:"tool_call_id,omitempty"`
 			} `json:"messages"`
-			MaxTokens   int        `json:"max_tokens"`
-			Temperature *float64   `json:"temperature,omitempty"`
-			Stream      bool       `json:"stream"`
+			MaxTokens   int      `json:"max_tokens"`
+			Temperature *float64 `json:"temperature,omitempty"`
+			Stream      bool     `json:"stream"`
+			Tools       []struct {
+				Type     string `json:"type"`
+				Function struct {
+					Name        string         `json:"name"`
+					Description string         `json:"description"`
+					Parameters  map[string]any `json:"parameters"`
+				} `json:"function"`
+			} `json:"tools,omitempty"`
+			ToolChoice any `json:"tool_choice,omitempty"`
 		}
 		if err := json.Unmarshal(body, &oaiReq); err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusBadRequest)
@@ -2300,7 +2403,8 @@ func startServer(port string) {
 		var systemMsgs FlexibleSystem
 		var chatMsgs []AnthropicRequestMessage
 		for _, m := range oaiReq.Messages {
-			if m.Role == "system" {
+			switch m.Role {
+			case "system":
 				text := ""
 				switch v := m.Content.(type) {
 				case string:
@@ -2310,7 +2414,64 @@ func startServer(port string) {
 					text = string(b)
 				}
 				systemMsgs = append(systemMsgs, AnthropicSystemMessage{Type: "text", Text: text})
-			} else {
+			case "assistant":
+				if len(m.ToolCalls) > 0 {
+					// Convert assistant message with tool_calls to Anthropic tool_use content blocks
+					var content []any
+					if m.Content != nil {
+						if text, ok := m.Content.(string); ok && text != "" {
+							content = append(content, map[string]any{"type": "text", "text": text})
+						}
+					}
+					for _, tc := range m.ToolCalls {
+						var input map[string]any
+						json.Unmarshal([]byte(tc.Function.Arguments), &input)
+						if input == nil {
+							input = map[string]any{}
+						}
+						content = append(content, map[string]any{
+							"type":  "tool_use",
+							"id":    tc.ID,
+							"name":  tc.Function.Name,
+							"input": input,
+						})
+					}
+					chatMsgs = append(chatMsgs, AnthropicRequestMessage{Role: "assistant", Content: content})
+				} else {
+					chatMsgs = append(chatMsgs, AnthropicRequestMessage{Role: "assistant", Content: m.Content})
+				}
+			case "tool":
+				// Convert tool result to Anthropic tool_result content block in a user message
+				toolResult := map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": m.ToolCallID,
+				}
+				if m.Content != nil {
+					if text, ok := m.Content.(string); ok {
+						toolResult["content"] = text
+					} else {
+						b, _ := json.Marshal(m.Content)
+						toolResult["content"] = string(b)
+					}
+				}
+				// Merge consecutive tool results into one user message
+				merged := false
+				if len(chatMsgs) > 0 {
+					last := &chatMsgs[len(chatMsgs)-1]
+					if last.Role == "user" {
+						if arr, ok := last.Content.([]any); ok {
+							last.Content = append(arr, toolResult)
+							merged = true
+						}
+					}
+				}
+				if !merged {
+					chatMsgs = append(chatMsgs, AnthropicRequestMessage{
+						Role:    "user",
+						Content: []any{toolResult},
+					})
+				}
+			default:
 				chatMsgs = append(chatMsgs, AnthropicRequestMessage{Role: m.Role, Content: m.Content})
 			}
 		}
@@ -2318,10 +2479,27 @@ func startServer(port string) {
 		if maxTok == 0 {
 			maxTok = 4096
 		}
+		// Convert OpenAI tools to Anthropic tools
+		var anthropicTools []AnthropicTool
+		includeTools := true
+		if tc, ok := oaiReq.ToolChoice.(string); ok && tc == "none" {
+			includeTools = false
+		}
+		if includeTools {
+			for _, t := range oaiReq.Tools {
+				anthropicTools = append(anthropicTools, AnthropicTool{
+					Name:        t.Function.Name,
+					Description: t.Function.Description,
+					InputSchema: t.Function.Parameters,
+				})
+			}
+		}
+
 		anthropicReq := AnthropicRequest{
 			Model:       oaiReq.Model,
 			Messages:    chatMsgs,
 			System:      systemMsgs,
+			Tools:       anthropicTools,
 			MaxTokens:   maxTok,
 			Temperature: oaiReq.Temperature,
 			Stream:      false, // always non-stream, convert below if needed
