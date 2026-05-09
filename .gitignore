@@ -1,3 +1,4 @@
 *.exe
-
-*response.rawkiro2pi
+*response.raw
+kiro2pi
+PLAN-*.md
