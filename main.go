@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -20,6 +21,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/bestk/kiro2cc/parser"
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
@@ -47,6 +51,9 @@ const (
 
 // Observability database
 var observDB *sql.DB
+
+// Bedrock client for embeddings (nil if not enabled)
+var bedrockClient *bedrockruntime.Client
 
 func initObservabilityDB() error {
 	home, err := os.UserHomeDir()
@@ -2268,12 +2275,183 @@ func logMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// initBedrockClient initializes the Bedrock client if enabled via env vars.
+func initBedrockClient() {
+	profile := os.Getenv("BEDROCK_AWS_PROFILE")
+	enabled := os.Getenv("BEDROCK_ENABLED") == "1"
+	if profile == "" && !enabled {
+		return
+	}
+	region := os.Getenv("BEDROCK_REGION")
+	if region == "" {
+		region = "us-west-2"
+	}
+	opts := []func(*awsconfig.LoadOptions) error{
+		awsconfig.WithRegion(region),
+	}
+	if profile != "" {
+		opts = append(opts, awsconfig.WithSharedConfigProfile(profile))
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(context.Background(), opts...)
+	if err != nil {
+		log.Printf("Warning: Bedrock client init failed: %v", err)
+		return
+	}
+	bedrockClient = bedrockruntime.NewFromConfig(cfg)
+	log.Printf("Bedrock client initialized (region=%s, profile=%s)", region, profile)
+}
+
+// handleEmbeddings handles POST /v1/embeddings requests.
+func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+		return
+	}
+	if bedrockClient == nil {
+		http.Error(w, `{"error":{"message":"embeddings not enabled"}}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		Model     string `json:"model"`
+		Input     any    `json:"input"`
+		InputType string `json:"input_type,omitempty"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusBadRequest)
+		return
+	}
+	if req.Model == "" {
+		http.Error(w, `{"error":{"message":"missing required field: model"}}`, http.StatusBadRequest)
+		return
+	}
+
+	// Normalize input to []string
+	var texts []string
+	switch v := req.Input.(type) {
+	case string:
+		texts = []string{v}
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				texts = append(texts, s)
+			}
+		}
+	default:
+		http.Error(w, `{"error":{"message":"input must be string or array of strings"}}`, http.StatusBadRequest)
+		return
+	}
+	if len(texts) == 0 {
+		http.Error(w, `{"error":{"message":"input is empty"}}`, http.StatusBadRequest)
+		return
+	}
+
+	start := time.Now()
+	var allEmbeddings [][]float64
+	var totalTokens int
+
+	if strings.HasPrefix(req.Model, "amazon.titan") {
+		// Titan: one text per call
+		for _, text := range texts {
+			payload, _ := json.Marshal(map[string]any{"inputText": text})
+			out, err := bedrockClient.InvokeModel(context.Background(), &bedrockruntime.InvokeModelInput{
+				ModelId:     aws.String(req.Model),
+				ContentType: aws.String("application/json"),
+				Body:        payload,
+			})
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusBadGateway)
+				return
+			}
+			var resp struct {
+				Embedding       []float64 `json:"embedding"`
+				InputTextTokenCount int   `json:"inputTextTokenCount"`
+			}
+			json.Unmarshal(out.Body, &resp)
+			allEmbeddings = append(allEmbeddings, resp.Embedding)
+			totalTokens += resp.InputTextTokenCount
+		}
+	} else {
+		// Cohere: batch up to 96
+		inputType := req.InputType
+		if inputType == "" {
+			inputType = "search_query"
+		}
+		const batchSize = 96
+		for i := 0; i < len(texts); i += batchSize {
+			end := i + batchSize
+			if end > len(texts) {
+				end = len(texts)
+			}
+			batch := texts[i:end]
+			payload, _ := json.Marshal(map[string]any{
+				"texts":      batch,
+				"input_type": inputType,
+				"truncate":   "END",
+			})
+			out, err := bedrockClient.InvokeModel(context.Background(), &bedrockruntime.InvokeModelInput{
+				ModelId:     aws.String(req.Model),
+				ContentType: aws.String("application/json"),
+				Body:        payload,
+			})
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), http.StatusBadGateway)
+				return
+			}
+			var resp struct {
+				Embeddings [][]float64 `json:"embeddings"`
+			}
+			json.Unmarshal(out.Body, &resp)
+			allEmbeddings = append(allEmbeddings, resp.Embeddings...)
+		}
+		// Estimate tokens (Cohere doesn't return token count)
+		for _, t := range texts {
+			totalTokens += len(t) / 4
+		}
+	}
+
+	// Build OpenAI-compatible response
+	data := make([]map[string]any, len(allEmbeddings))
+	for i, emb := range allEmbeddings {
+		data[i] = map[string]any{"object": "embedding", "index": i, "embedding": emb}
+	}
+	resp := map[string]any{
+		"object": "list",
+		"model":  req.Model,
+		"data":   data,
+		"usage":  map[string]any{"prompt_tokens": totalTokens, "total_tokens": totalTokens},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+
+	// Log to observability
+	if observDB != nil {
+		latency := time.Since(start).Milliseconds()
+		go func() {
+			observDB.Exec(
+				`INSERT INTO call_log (id,created_at,model,endpoint,stream,input_tokens,latency_ms,status_code) VALUES (?,?,?,?,?,?,?,?)`,
+				uuid.New().String(), time.Now().UTC().Format(time.RFC3339), req.Model, "/v1/embeddings", 0, totalTokens, latency, 200,
+			)
+		}()
+	}
+}
+
 // startServer 启动HTTP代理服务器
 func startServer(port string) {
 	// Initialize observability database
 	if err := initObservabilityDB(); err != nil {
 		log.Printf("Warning: observability DB init failed: %v", err)
 	}
+
+	// Initialize Bedrock client (opt-in)
+	initBedrockClient()
 
 	// 创建路由器
 	mux := http.NewServeMux()
@@ -2772,6 +2950,11 @@ func startServer(port string) {
 		w.Write([]byte("OK"))
 	}))
 
+	// Embeddings endpoint (conditional)
+	if bedrockClient != nil {
+		mux.HandleFunc("/v1/embeddings", logMiddleware(handleEmbeddings))
+	}
+
 	// 添加404处理
 	mux.HandleFunc("/", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("警告: 访问未知端点 %s %s\n", r.Method, r.URL.Path)
@@ -2786,6 +2969,9 @@ func startServer(port string) {
 	fmt.Printf("  GET  /health      - 健康检查\n")
 	fmt.Printf("  GET  /stats       - 调用统计\n")
 	fmt.Printf("  GET  /logs        - 调用日志\n")
+	if bedrockClient != nil {
+		fmt.Printf("  POST /v1/embeddings - Bedrock Embeddings (OpenAI兼容)\n")
+	}
 	fmt.Printf("按Ctrl+C停止服务器\n")
 
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
