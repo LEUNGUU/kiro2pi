@@ -883,19 +883,23 @@ var ModelMap = map[string]string{
 	"claude-opus-4.5":           "claude-opus-4.5",
 	"claude-opus-4.6":           "claude-opus-4.6",
 	"claude-opus-4.7":           "claude-opus-4.7",
+	"claude-opus-4.8":           "claude-opus-4.8",
 	"claude-sonnet-4.6":         "claude-sonnet-4.6",
 	"deepseek-3.2":              "deepseek-3.2",
 	"minimax-m2.5":              "minimax-m2.5",
 	"glm-5":                     "glm-5",
+	"kimi-k2.5":                 "kimi-k2.5",
 	// Anthropic SDK normalizes dots to hyphens in model names
 	"claude-sonnet-4-5":         "claude-sonnet-4.5",
 	"claude-haiku-4-5":          "claude-haiku-4.5",
 	"claude-opus-4-5":           "claude-opus-4.5",
 	"claude-opus-4-6":           "claude-opus-4.6",
 	"claude-opus-4-7":           "claude-opus-4.7",
+	"claude-opus-4-8":           "claude-opus-4.8",
 	"claude-sonnet-4-6":         "claude-sonnet-4.6",
 	"deepseek-3-2":              "deepseek-3.2",
 	"minimax-m2-5":              "minimax-m2.5",
+	"kimi-k2-5":                 "kimi-k2.5",
 }
 
 // generateUUID generates a simple UUID v4
