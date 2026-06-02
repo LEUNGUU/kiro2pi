@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,9 +32,9 @@ import (
 
 // Token management with mutex for thread-safety
 var (
-	tokenMutex       sync.RWMutex
-	cachedToken      *TokenData
-	tokenExpiresAt   time.Time
+	tokenMutex            sync.RWMutex
+	cachedToken           *TokenData
+	tokenExpiresAt        time.Time
 	tokenRefreshThreshold = 5 * time.Minute // Refresh token 5 minutes before expiry
 )
 
@@ -43,9 +44,25 @@ const (
 	retryBaseDelay = 1 * time.Second
 )
 
+// Shared upstream HTTP client. A per-request &http.Client{} has no Timeout
+// (zero value = wait forever), leaking goroutines if upstream hangs, and
+// disables connection reuse. ResponseHeaderTimeout caps time-to-first-byte
+// (response headers), not the streaming body duration.
+var upstreamClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+	},
+}
+
 // Request size limits
 const (
-	maxRequestBytes        = 590 * 1024 // 590KB max request payload (Kiro API hard limit is ~615KB)
+	maxRequestBytes         = 590 * 1024 // 590KB max request payload (Kiro API hard limit is ~615KB)
 	maxToolResultContentLen = 10 * 1024  // 10KB max per tool result content
 )
 
@@ -502,10 +519,10 @@ type CodeWhispererTool struct {
 // HistoryUserMessage 表示历史记录中的用户消息
 type HistoryUserMessage struct {
 	UserInputMessage struct {
-		Content                 string                         `json:"content"`
+		Content                 string                          `json:"content"`
 		UserInputMessageContext *HistoryUserInputMessageContext `json:"userInputMessageContext,omitempty"`
-		Origin                  string                         `json:"origin,omitempty"`
-		Images                  []KiroImage                    `json:"images,omitempty"`
+		Origin                  string                          `json:"origin,omitempty"`
+		Images                  []KiroImage                     `json:"images,omitempty"`
 	} `json:"userInputMessage"`
 }
 
@@ -635,7 +652,7 @@ func getMessageContent(content any) string {
 							if cb.Text != nil {
 								texts = append(texts, *cb.Text)
 							}
-						// tool_use blocks are skipped - we only extract text content for history
+							// tool_use blocks are skipped - we only extract text content for history
 						}
 					}
 
@@ -823,15 +840,15 @@ func extractCwdFromSystemPrompt(systemMsgs []AnthropicSystemMessage) string {
 // CodeWhispererRequest 表示 CodeWhisperer API 的请求结构 (Q API format)
 type CodeWhispererRequest struct {
 	ConversationState struct {
-		ChatTriggerType       string `json:"chatTriggerType"`
-		ConversationId        string `json:"conversationId"`
-		AgentContinuationId   string `json:"agentContinuationId,omitempty"`
-		AgentTaskType         string `json:"agentTaskType,omitempty"`
-		CurrentMessage        struct {
+		ChatTriggerType     string `json:"chatTriggerType"`
+		ConversationId      string `json:"conversationId"`
+		AgentContinuationId string `json:"agentContinuationId,omitempty"`
+		AgentTaskType       string `json:"agentTaskType,omitempty"`
+		CurrentMessage      struct {
 			UserInputMessage struct {
-				Content                 string `json:"content"`
-				ModelId                 string `json:"modelId"`
-				Origin                  string `json:"origin"`
+				Content                 string      `json:"content"`
+				ModelId                 string      `json:"modelId"`
+				Origin                  string      `json:"origin"`
 				Images                  []KiroImage `json:"images,omitempty"`
 				UserInputMessageContext struct {
 					ToolResults []map[string]any    `json:"toolResults,omitempty"`
@@ -877,29 +894,29 @@ type CodeWhispererEvent struct {
 
 var ModelMap = map[string]string{
 	// Kiro supported models
-	"claude-sonnet-4.5":         "claude-sonnet-4.5",
-	"claude-sonnet-4":           "claude-sonnet-4",
-	"claude-haiku-4.5":          "claude-haiku-4.5",
-	"claude-opus-4.5":           "claude-opus-4.5",
-	"claude-opus-4.6":           "claude-opus-4.6",
-	"claude-opus-4.7":           "claude-opus-4.7",
-	"claude-opus-4.8":           "claude-opus-4.8",
-	"claude-sonnet-4.6":         "claude-sonnet-4.6",
-	"deepseek-3.2":              "deepseek-3.2",
-	"minimax-m2.5":              "minimax-m2.5",
-	"glm-5":                     "glm-5",
-	"kimi-k2.5":                 "kimi-k2.5",
+	"claude-sonnet-4.5": "claude-sonnet-4.5",
+	"claude-sonnet-4":   "claude-sonnet-4",
+	"claude-haiku-4.5":  "claude-haiku-4.5",
+	"claude-opus-4.5":   "claude-opus-4.5",
+	"claude-opus-4.6":   "claude-opus-4.6",
+	"claude-opus-4.7":   "claude-opus-4.7",
+	"claude-opus-4.8":   "claude-opus-4.8",
+	"claude-sonnet-4.6": "claude-sonnet-4.6",
+	"deepseek-3.2":      "deepseek-3.2",
+	"minimax-m2.5":      "minimax-m2.5",
+	"glm-5":             "glm-5",
+	"kimi-k2.5":         "kimi-k2.5",
 	// Anthropic SDK normalizes dots to hyphens in model names
-	"claude-sonnet-4-5":         "claude-sonnet-4.5",
-	"claude-haiku-4-5":          "claude-haiku-4.5",
-	"claude-opus-4-5":           "claude-opus-4.5",
-	"claude-opus-4-6":           "claude-opus-4.6",
-	"claude-opus-4-7":           "claude-opus-4.7",
-	"claude-opus-4-8":           "claude-opus-4.8",
-	"claude-sonnet-4-6":         "claude-sonnet-4.6",
-	"deepseek-3-2":              "deepseek-3.2",
-	"minimax-m2-5":              "minimax-m2.5",
-	"kimi-k2-5":                 "kimi-k2.5",
+	"claude-sonnet-4-5": "claude-sonnet-4.5",
+	"claude-haiku-4-5":  "claude-haiku-4.5",
+	"claude-opus-4-5":   "claude-opus-4.5",
+	"claude-opus-4-6":   "claude-opus-4.6",
+	"claude-opus-4-7":   "claude-opus-4.7",
+	"claude-opus-4-8":   "claude-opus-4.8",
+	"claude-sonnet-4-6": "claude-sonnet-4.6",
+	"deepseek-3-2":      "deepseek-3.2",
+	"minimax-m2-5":      "minimax-m2.5",
+	"kimi-k2-5":         "kimi-k2.5",
 }
 
 // generateUUID generates a simple UUID v4
@@ -1399,14 +1416,14 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 					if len(pendingUserContent) > 0 && len(toolUses) > 0 {
 						// Abort scenario detected: assistant has toolUses but user sent new message without tool_result
 						log.Printf("DEBUG: Abort scenario detected - assistant has toolUses but pending user content exists")
-						
+
 						// First add the assistant message with toolUses
 						assistantMsg := HistoryAssistantMessage{}
 						assistantMsg.AssistantResponseMessage.MessageId = generateUUID()
 						assistantMsg.AssistantResponseMessage.ToolUses = toolUses
 						assistantMsg.AssistantResponseMessage.Content = assistantContent
 						history = append(history, assistantMsg)
-						
+
 						// Then add user message with cancelled tool results
 						var cancelledResults []map[string]any
 						for _, toolUse := range toolUses {
@@ -1435,7 +1452,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 						// Keep pendingUserContent - it will go to currentMessage
 						continue
 					}
-					
+
 					// Normal case: add pending user content first, then assistant
 					if len(pendingUserContent) > 0 || len(pendingUserImages) > 0 {
 						userMsg := HistoryUserMessage{}
@@ -2037,6 +2054,7 @@ func oaiNonStreamHandler(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 	handleNonStreamRequest(rec, anthropicReq, accessToken)
 
 	if rec.code != http.StatusOK && rec.code != 0 {
+		copyHeaders(w, rec.headers)
 		w.WriteHeader(rec.code)
 		w.Write(rec.body.Bytes())
 		return
@@ -2095,9 +2113,9 @@ func oaiNonStreamHandler(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 	}
 
 	oaiResp := map[string]any{
-		"id":      "chatcmpl-kiro2pi",
-		"object":  "chat.completion",
-		"model":   anthResp.Model,
+		"id":     "chatcmpl-kiro2pi",
+		"object": "chat.completion",
+		"model":  anthResp.Model,
 		"choices": []map[string]any{{
 			"index":         0,
 			"message":       msg,
@@ -2229,6 +2247,24 @@ func oaiStreamHandler(w http.ResponseWriter, anthropicReq AnthropicRequest, acce
 		case "message_stop":
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
+		case "error":
+			// Upstream error (e.g. throttling after retries). SSE headers are
+			// already sent, so surface it in-band as an OpenAI error chunk
+			// instead of silently truncating the stream.
+			errObj, _ := evt["error"].(map[string]any)
+			msg := "upstream error"
+			if errObj != nil {
+				if m, ok := errObj["message"].(string); ok {
+					msg = m
+				}
+			}
+			chunk := map[string]any{
+				"error": map[string]any{"message": msg, "type": "upstream_error"},
+			}
+			b, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
 		}
 	}
 }
@@ -2241,7 +2277,7 @@ type responseRecorder struct {
 	code    int
 }
 
-func (r *responseRecorder) Header() http.Header { return r.headers }
+func (r *responseRecorder) Header() http.Header  { return r.headers }
 func (r *responseRecorder) WriteHeader(code int) { r.code = code }
 func (r *responseRecorder) Write(b []byte) (int, error) {
 	if r.pipe != nil {
@@ -2254,6 +2290,16 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 }
 func (r *responseRecorder) Flush() {
 	// no-op for recorder; real flushing happens on the outer writer
+}
+
+// copyHeaders forwards captured headers (e.g. Retry-After on a 429) from a
+// responseRecorder to the real writer before writing the status code.
+func copyHeaders(dst http.ResponseWriter, src http.Header) {
+	for k, vs := range src {
+		for _, v := range vs {
+			dst.Header().Add(k, v)
+		}
+	}
 }
 
 func logMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -2375,8 +2421,8 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			var resp struct {
-				Embedding       []float64 `json:"embedding"`
-				InputTextTokenCount int   `json:"inputTextTokenCount"`
+				Embedding           []float64 `json:"embedding"`
+				InputTextTokenCount int       `json:"inputTextTokenCount"`
 			}
 			json.Unmarshal(out.Body, &resp)
 			allEmbeddings = append(allEmbeddings, resp.Embedding)
@@ -2551,9 +2597,9 @@ func startServer(port string) {
 		var oaiReq struct {
 			Model    string `json:"model"`
 			Messages []struct {
-				Role       string `json:"role"`
-				Content    any    `json:"content"`
-				ToolCalls  []struct {
+				Role      string `json:"role"`
+				Content   any    `json:"content"`
+				ToolCalls []struct {
 					ID       string `json:"id"`
 					Type     string `json:"type"`
 					Function struct {
@@ -2770,6 +2816,7 @@ func startServer(port string) {
 		rec := &responseRecorder{headers: make(http.Header), body: &bytes.Buffer{}}
 		handleNonStreamRequest(rec, anthropicReq, token.AccessToken)
 		if rec.code != http.StatusOK && rec.code != 0 {
+			copyHeaders(w, rec.headers)
 			w.WriteHeader(rec.code)
 			w.Write(rec.body.Bytes())
 			return
@@ -2779,8 +2826,8 @@ func startServer(port string) {
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"content"`
-			Model      string `json:"model"`
-			Usage      struct {
+			Model string `json:"model"`
+			Usage struct {
 				InputTokens  int `json:"input_tokens"`
 				OutputTokens int `json:"output_tokens"`
 			} `json:"usage"`
@@ -3008,7 +3055,7 @@ func sendQApiRequest(cwReq CodeWhispererRequest, accessToken string) ([]byte, er
 	proxyReq.Header.Set("User-Agent", "aws-sdk-rust/1.3.10 ua/2.1 api/codewhispererstreaming/0.1.12842 os/linux lang/go app/kiro2cc")
 	proxyReq.Header.Set("Accept", "*/*")
 
-	client := &http.Client{}
+	client := upstreamClient
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		return nil, fmt.Errorf("request error: %w", err)
@@ -3071,7 +3118,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 	proxyReq.Header.Set("Accept", "*/*")
 
 	// 发送请求
-	client := &http.Client{}
+	client := upstreamClient
 
 	resp, err := client.Do(proxyReq)
 	if err != nil {
@@ -3102,6 +3149,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 			return
 		} else if isRetryableStatusCode(resp.StatusCode) {
 			// Retry for 429 (rate limit) and 5xx (server errors)
+			lastStatus := resp.StatusCode
 			for attempt := 0; attempt < maxRetries; attempt++ {
 				delay := calculateRetryDelay(attempt)
 				log.Printf("收到%d错误，%v后重试 (尝试 %d/%d)...", resp.StatusCode, delay, attempt+1, maxRetries)
@@ -3135,6 +3183,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 					goto processResponse
 				}
 				retryResp.Body.Close()
+				lastStatus = retryResp.StatusCode
 
 				if !isRetryableStatusCode(retryResp.StatusCode) {
 					// Non-retryable error
@@ -3143,7 +3192,15 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 					return
 				}
 			}
-			sendErrorEvent(w, flusher, "CodeWhisperer请求失败", fmt.Errorf("重试%d次后仍失败，最后状态码: %d", maxRetries, resp.StatusCode))
+			// 重试预算耗尽：若最后一次仍是限流(429)，透传可重试的 429 + Retry-After
+			// 给调用方，让其自行退避，而不是含糊的 read 超时。
+			if lastStatus == http.StatusTooManyRequests {
+				w.Header().Set("Retry-After", "4")
+				w.WriteHeader(http.StatusTooManyRequests)
+				sendErrorEvent(w, flusher, "上游限流，请稍后重试", fmt.Errorf("upstream throttled after %d retries", maxRetries))
+				return
+			}
+			sendErrorEvent(w, flusher, "CodeWhisperer请求失败", fmt.Errorf("重试%d次后仍失败，最后状态码: %d", maxRetries, lastStatus))
 			return
 		} else {
 			sendErrorEvent(w, flusher, "CodeWhisperer请求失败", fmt.Errorf("状态码: %d, 响应: %s", resp.StatusCode, string(body)))
@@ -3204,9 +3261,9 @@ processResponse:
 	outputTokens := 0
 	hasRegularToolUse := false
 	continuationCount := 0
-	maxContinuations := 10 // Safety limit to prevent infinite loops
+	maxContinuations := 10             // Safety limit to prevent infinite loops
 	textIndex := parseResult.TextIndex // Track text index (0 if no thinking, 1 if thinking present)
-	textBlockStarted := false // Track whether a text content_block_start was emitted
+	textBlockStarted := false          // Track whether a text content_block_start was emitted
 
 	for continuationCount < maxContinuations {
 		continuationCount++
@@ -3364,7 +3421,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	proxyReq.Header.Set("Accept", "*/*")
 
 	// 发送请求
-	client := &http.Client{}
+	client := upstreamClient
 
 	resp, err := client.Do(proxyReq)
 	if err != nil {
@@ -3396,6 +3453,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 			return
 		} else if isRetryableStatusCode(resp.StatusCode) {
 			// Retry for 429 (rate limit) and 5xx (server errors)
+			lastStatus := resp.StatusCode
 			for attempt := 0; attempt < maxRetries; attempt++ {
 				delay := calculateRetryDelay(attempt)
 				log.Printf("非流式请求收到%d错误，%v后重试 (尝试 %d/%d)...", resp.StatusCode, delay, attempt+1, maxRetries)
@@ -3429,6 +3487,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 					goto processNonStreamResponse
 				}
 				retryResp.Body.Close()
+				lastStatus = retryResp.StatusCode
 
 				if !isRetryableStatusCode(retryResp.StatusCode) {
 					// Non-retryable error
@@ -3437,7 +3496,13 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 					return
 				}
 			}
-			http.Error(w, fmt.Sprintf("CodeWhisperer请求失败: 重试%d次后仍失败，最后状态码: %d", maxRetries, resp.StatusCode), http.StatusBadGateway)
+			// 重试预算耗尽：若最后一次仍是限流(429)，透传可重试的 429 + Retry-After。
+			if lastStatus == http.StatusTooManyRequests {
+				w.Header().Set("Retry-After", "4")
+				http.Error(w, "上游限流，请稍后重试", http.StatusTooManyRequests)
+				return
+			}
+			http.Error(w, fmt.Sprintf("CodeWhisperer请求失败: 重试%d次后仍失败，最后状态码: %d", maxRetries, lastStatus), http.StatusBadGateway)
 			return
 		} else {
 			http.Error(w, fmt.Sprintf("CodeWhisperer请求失败: 状态码 %d, 响应: %s", resp.StatusCode, string(body)), http.StatusBadGateway)
@@ -3570,7 +3635,7 @@ processNonStreamResponse:
 			"text": "",
 		})
 	}
-	
+
 	// 检查是否是错误响应
 	if strings.Contains(string(cwRespBody), "Improperly formed request.") {
 		fmt.Printf("错误: CodeWhisperer返回格式错误: %s\n", respBodyStr)
