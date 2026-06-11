@@ -50,6 +50,7 @@ func ParseEvents(resp []byte) []SSEEvent {
 	hasThinking := false                   // Track if we've seen thinking blocks
 	textIndex := 0                         // Text index: 0 if no thinking, 1 if thinking present
 	tagParser := NewThinkingTagParser()    // Parser for <thinking> tags in text content
+	xmlParser := NewXmlToolParser()         // Parser for XML tool calls in text content
 
 	r := bytes.NewReader(resp)
 	for {
@@ -100,7 +101,7 @@ func ParseEvents(resp []byte) []SSEEvent {
 
 			// Convert event to SSE, tracking started tools to avoid duplicate starts
 			// Also track content for deduplication
-			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex, tagParser)
+			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex, tagParser, xmlParser)
 			events = append(events, sseEvents...)
 
 			// Add message_delta for tool_use stop, but skip for thinking tools
@@ -124,6 +125,15 @@ func ParseEvents(resp []byte) []SSEEvent {
 		} else {
 			log.Println("json unmarshal error:", err)
 		}
+	}
+
+	// Flush XML tool parser - emit any remaining buffered content
+	flushResult := xmlParser.Flush()
+	if flushResult.RegularText != "" {
+		events = append(events, emitTextEvents(flushResult.RegularText, startedTools, textIndex)...)
+	}
+	for _, tc := range flushResult.ToolCalls {
+		events = append(events, emitXmlToolEvents(tc, startedTools, &nextToolIndex, textIndex)...)
 	}
 
 	return events
@@ -355,10 +365,87 @@ func emitTextEvents(content string, startedTools map[string]bool, textIndex int)
 	return events
 }
 
+// emitXmlToolEvents generates SSE events for a tool call detected from XML text.
+// Ensures text block is started first (for sequential indices), then emits tool_use events.
+func emitXmlToolEvents(tc XmlToolCall, startedTools map[string]bool, nextToolIndex *int, textIndex int) []SSEEvent {
+	var events []SSEEvent
+
+	// Ensure text block is emitted first so indices are sequential
+	if !startedTools["__text__"] {
+		startedTools["__text__"] = true
+		events = append(events, SSEEvent{
+			Event: "content_block_start",
+			Data: map[string]interface{}{
+				"type":  "content_block_start",
+				"index": textIndex,
+				"content_block": map[string]interface{}{"type": "text", "text": ""},
+			},
+		})
+	}
+
+	toolIndex := *nextToolIndex
+	*nextToolIndex++
+
+	// content_block_start for tool_use
+	events = append(events, SSEEvent{
+		Event: "content_block_start",
+		Data: map[string]interface{}{
+			"type":  "content_block_start",
+			"index": toolIndex,
+			"content_block": map[string]interface{}{
+				"type":  "tool_use",
+				"id":    tc.ID,
+				"name":  tc.Name,
+				"input": map[string]interface{}{},
+			},
+		},
+	})
+	startedTools[tc.ID] = true
+
+	// input_json_delta with full input
+	if tc.Input != "" && tc.Input != "{}" {
+		events = append(events, SSEEvent{
+			Event: "content_block_delta",
+			Data: map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": toolIndex,
+				"delta": map[string]interface{}{
+					"type":         "input_json_delta",
+					"partial_json": tc.Input,
+				},
+			},
+		})
+	}
+
+	// content_block_stop
+	events = append(events, SSEEvent{
+		Event: "content_block_stop",
+		Data: map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": toolIndex,
+		},
+	})
+
+	// message_delta with stop_reason=tool_use
+	events = append(events, SSEEvent{
+		Event: "message_delta",
+		Data: map[string]interface{}{
+			"type": "message_delta",
+			"delta": map[string]interface{}{
+				"stop_reason":   "tool_use",
+				"stop_sequence": nil,
+			},
+			"usage": map[string]interface{}{"output_tokens": 0},
+		},
+	})
+
+	return events
+}
+
 // convertAssistantEventWithTracking handles events with tool tracking to avoid duplicate content_block_start
 // Also implements content deduplication to prevent duplicate text content
 // Index assignment: thinking gets index 0 (if present), text gets index 1 (or 0 if no thinking), tools get subsequent indexes
-func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools map[string]bool, toolIndexMap map[string]int, thinkingToolIds map[string]bool, nextToolIndex *int, lastContent *string, hasThinking *bool, textIndex *int, tagParser *ThinkingTagParser) []SSEEvent {
+func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools map[string]bool, toolIndexMap map[string]int, thinkingToolIds map[string]bool, nextToolIndex *int, lastContent *string, hasThinking *bool, textIndex *int, tagParser *ThinkingTagParser, xmlParser *XmlToolParser) []SSEEvent {
 	var events []SSEEvent
 
 	// Convert "thinking" tool calls to thinking content blocks
@@ -418,9 +505,15 @@ func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools 
 			events = append(events, emitThinkingEvents(tagResult, startedTools)...)
 		}
 
-		// Emit regular content if any
+		// Emit regular content if any - feed through XML tool parser
 		if tagResult.RegularContent != "" {
-			events = append(events, emitTextEvents(tagResult.RegularContent, startedTools, *textIndex)...)
+			xmlResult := xmlParser.Feed(tagResult.RegularContent)
+			if xmlResult.RegularText != "" {
+				events = append(events, emitTextEvents(xmlResult.RegularText, startedTools, *textIndex)...)
+			}
+			for _, tc := range xmlResult.ToolCalls {
+				events = append(events, emitXmlToolEvents(tc, startedTools, nextToolIndex, *textIndex)...)
+			}
 		}
 	} else if evt.ToolUseId != "" && evt.Name != "" && !evt.Stop {
 		// Ensure text block is emitted before any tool_use block so indices are sequential
@@ -528,6 +621,7 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 	hasThinking := false    // Track if we've seen thinking blocks
 	textIndex := 0          // Text index: 0 if no thinking, 1 if thinking present
 	tagParser := NewThinkingTagParser() // Parser for <thinking> tags in text content
+	xmlParser := NewXmlToolParser()      // Parser for XML tool calls in text content
 
 	// Track thinking input fragments to accumulate full content
 	var thinkingInputBuilder strings.Builder
@@ -595,8 +689,13 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 				result.HasRegularTools = true
 			}
 
-			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex, tagParser)
+			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex, tagParser, xmlParser)
 			result.Events = append(result.Events, sseEvents...)
+
+			// Check if XML tool parser detected tool calls (sets HasRegularTools)
+			if xmlParser.hasDetectedTools {
+				result.HasRegularTools = true
+			}
 
 			// Add message_delta for non-thinking tool_use stop
 			if evt.ToolUseId != "" && evt.Name != "" && evt.Name != "thinking" {
@@ -617,6 +716,16 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 		} else {
 			log.Println("json unmarshal error:", err)
 		}
+	}
+
+	// Flush XML tool parser - emit any remaining buffered content
+	flushResult := xmlParser.Flush()
+	if flushResult.RegularText != "" {
+		result.Events = append(result.Events, emitTextEvents(flushResult.RegularText, startedTools, textIndex)...)
+	}
+	for _, tc := range flushResult.ToolCalls {
+		result.Events = append(result.Events, emitXmlToolEvents(tc, startedTools, &nextToolIndex, textIndex)...)
+		result.HasRegularTools = true
 	}
 
 	// Parse accumulated thinking input to extract actual thought content
