@@ -11,6 +11,8 @@ kiro2pi is a proxy server that translates Anthropic API requests to AWS CodeWhis
 - **main.go**: Single-file Go application containing all proxy logic
 - **Endpoints**:
   - `POST /v1/messages` - Anthropic API proxy (main endpoint)
+  - `POST /v1/embeddings` - Bedrock embeddings, OpenAI-compatible (only when Bedrock enabled)
+  - `POST /v1/rerank` - Bedrock Cohere Rerank 3.5, Cohere-compatible (only when Bedrock enabled)
   - `GET /health` - Health check
   - `/` - Catch-all (returns 404)
 
@@ -37,6 +39,11 @@ journalctl -u kiro2pi -f
 ### Debug Options
 - `DEBUG_SAVE_RAW=1`: Save raw API responses to `.raw` files
 - `DEBUG_ACCESS_LOG=1`: Enable detailed HTTP access logging (method, path, client IP)
+
+### Bedrock (optional, for `/v1/embeddings` and `/v1/rerank`)
+- `BEDROCK_ENABLED=1`: Enable the Bedrock-backed endpoints
+- `BEDROCK_AWS_PROFILE`: AWS shared-config profile (also enables the Bedrock endpoints)
+- `BEDROCK_REGION`: AWS region (default `us-west-2`). Rerank model is pinned to `cohere.rerank-v3-5:0`
 
 ## Systemd Service
 
