@@ -131,6 +131,9 @@ eval $(./kiro2pi export)
 | `CODEWHISPERER_PROFILE_ARN` | Required if not using kiro-cli. Your CodeWhisperer profile ARN |
 | `DEBUG_SAVE_RAW` | Set to `1` or `true` to save raw API responses for debugging |
 | `DEBUG_ACCESS_LOG` | Set to `1` or `true` to enable detailed HTTP access logging |
+| `BEDROCK_ENABLED` | Set to `1` to enable the Bedrock-backed `/v1/embeddings` and `/v1/rerank` endpoints |
+| `BEDROCK_AWS_PROFILE` | AWS shared-config profile to use for Bedrock (also enables the Bedrock endpoints) |
+| `BEDROCK_REGION` | AWS region for Bedrock (default `us-west-2`) |
 
 ## Platform Support
 
@@ -197,6 +200,29 @@ The proxy maps model names to CodeWhisperer models:
 
 Hyphenated aliases are also supported (e.g. `claude-opus-4-7` → `claude-opus-4.7`).
 
+## Bedrock Endpoints (optional)
+
+When Bedrock is enabled (`BEDROCK_ENABLED=1` or `BEDROCK_AWS_PROFILE=...`), two extra endpoints are served using AWS credentials from the configured profile/region.
+
+### `POST /v1/rerank` (Cohere-compatible)
+
+Proxies to AWS Bedrock **Cohere Rerank 3.5** (`cohere.rerank-v3-5:0`). The `model` field is optional; if provided it must equal `cohere.rerank-v3-5:0` or the request is rejected with `400`. Documents may be strings or `{"text": "..."}` objects (max 1000).
+
+```bash
+curl http://localhost:9090/v1/rerank \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "What is the capital of France?",
+    "documents": ["Paris is the capital of France.", "Berlin is in Germany."],
+    "top_n": 1,
+    "return_documents": true
+  }'
+```
+
+Response: `{ "id", "model", "results": [{ "index", "relevance_score", "document"? }], "meta" }`.
+
+Region note: Cohere Rerank 3.5 is available in `us-east-1`, `us-west-2`, `ap-northeast-1`, `ca-central-1`, and `eu-central-1`.
+
 ## API Endpoints
 
 | Endpoint | Description |
@@ -205,6 +231,8 @@ Hyphenated aliases are also supported (e.g. `claude-opus-4-7` → `claude-opus-4
 | `POST /v1/chat/completions` | OpenAI Chat Completions API (streaming & non-streaming) |
 | `POST /v1/completions` | OpenAI legacy Completions API |
 | `GET /v1/models` | List available models |
+| `POST /v1/embeddings` | Bedrock embeddings, OpenAI-compatible (requires Bedrock enabled) |
+| `POST /v1/rerank` | Bedrock Cohere Rerank 3.5, Cohere-compatible (requires Bedrock enabled) |
 | `GET /health` | Health check |
 | `GET /stats` | Call statistics (aggregated by model/day) |
 | `GET /logs` | Call log entries (paginated) |
