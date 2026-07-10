@@ -907,6 +907,7 @@ var ModelMap = map[string]string{
 	"minimax-m2.5":      "minimax-m2.5",
 	"glm-5":             "glm-5",
 	"kimi-k2.5":         "kimi-k2.5",
+	"gpt-5.5":           "openai-gpt-5.5",
 	// Anthropic SDK normalizes dots to hyphens in model names
 	"claude-sonnet-4-5": "claude-sonnet-4.5",
 	"claude-haiku-4-5":  "claude-haiku-4.5",
@@ -918,6 +919,7 @@ var ModelMap = map[string]string{
 	"deepseek-3-2":      "deepseek-3.2",
 	"minimax-m2-5":      "minimax-m2.5",
 	"kimi-k2-5":         "kimi-k2.5",
+	"gpt-5-5":           "openai-gpt-5.5",
 }
 
 // generateUUID generates a simple UUID v4
@@ -3032,6 +3034,7 @@ func startServer(port string) {
 			{"id": "minimax-m2.5", "type": "model", "display_name": "MiniMax M2.5", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "glm-5", "type": "model", "display_name": "GLM-5", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "kimi-k2.5", "type": "model", "display_name": "Kimi K2.5", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "gpt-5.5", "type": "model", "display_name": "GPT-5.5", "created_at": "2025-01-01T00:00:00Z"},
 		}
 		resp := map[string]any{
 			"data":     models,
