@@ -908,6 +908,8 @@ var ModelMap = map[string]string{
 	"glm-5":             "glm-5",
 	"kimi-k2.5":         "kimi-k2.5",
 	"gpt-5.5":           "gpt-5.5",
+	"gpt-5.6-sol":       "gpt-5.6-sol",
+	"claude-fable-5":    "claude-fable-5",
 	// Anthropic SDK normalizes dots to hyphens in model names
 	"claude-sonnet-4-5": "claude-sonnet-4.5",
 	"claude-haiku-4-5":  "claude-haiku-4.5",
@@ -920,6 +922,7 @@ var ModelMap = map[string]string{
 	"minimax-m2-5":      "minimax-m2.5",
 	"kimi-k2-5":         "kimi-k2.5",
 	"gpt-5-5":           "gpt-5.5",
+	"gpt-5-6-sol":       "gpt-5.6-sol",
 }
 
 // generateUUID generates a simple UUID v4
@@ -3035,6 +3038,8 @@ func startServer(port string) {
 			{"id": "glm-5", "type": "model", "display_name": "GLM-5", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "kimi-k2.5", "type": "model", "display_name": "Kimi K2.5", "created_at": "2025-01-01T00:00:00Z"},
 			{"id": "gpt-5.5", "type": "model", "display_name": "GPT-5.5", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "gpt-5.6-sol", "type": "model", "display_name": "GPT-5.6 Sol", "created_at": "2025-01-01T00:00:00Z"},
+			{"id": "claude-fable-5", "type": "model", "display_name": "Claude Fable 5", "created_at": "2025-01-01T00:00:00Z"},
 		}
 		resp := map[string]any{
 			"data":     models,
