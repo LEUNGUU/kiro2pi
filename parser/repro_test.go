@@ -8,18 +8,19 @@ import (
 )
 
 // encodeFrame builds one CodeWhisperer event-stream frame around a JSON payload.
-// Layout: [totalLen u32][headerLen u32][header bytes][ "vent"+payload ][crc u32]
+// Layout: [totalLen u32][headerLen u32][prelude CRC u32][headers][payload][message CRC u32]
 func encodeFrame(payload string) []byte {
-	header := []byte{} // empty header; parser only skips it
-	body := []byte("vent" + payload)
+	header := []byte{} // Empty header exercises the parser's legacy fallback path.
+	body := []byte(payload)
 	headerLen := uint32(len(header))
-	totalLen := uint32(12 + len(header) + len(body))
+	totalLen := uint32(16 + len(header) + len(body))
 	var buf bytes.Buffer
 	binary.Write(&buf, binary.BigEndian, totalLen)
 	binary.Write(&buf, binary.BigEndian, headerLen)
+	binary.Write(&buf, binary.BigEndian, uint32(0)) // prelude CRC (not validated by parser)
 	buf.Write(header)
 	buf.Write(body)
-	binary.Write(&buf, binary.BigEndian, uint32(0)) // crc (skipped)
+	binary.Write(&buf, binary.BigEndian, uint32(0)) // message CRC (not validated by parser)
 	return buf.Bytes()
 }
 

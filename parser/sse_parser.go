@@ -24,6 +24,112 @@ type assistantResponseEvent struct {
 	Stop      bool    `json:"stop"`
 }
 
+type reasoningContentEvent struct {
+	Text            string `json:"text"`
+	Signature       string `json:"signature"`
+	RedactedContent []byte `json:"redactedContent"`
+}
+
+type eventFrame struct {
+	EventType string
+	Payload   []byte
+}
+
+// decodeFrames decodes AWS event-stream frames, returning all complete frames.
+// Malformed or truncated input stops decoding without discarding earlier frames.
+func decodeFrames(resp []byte) []eventFrame {
+	frames := []eventFrame{}
+	r := bytes.NewReader(resp)
+
+	for r.Len() >= 12 {
+		var totalLen, headerLen uint32
+		if err := binary.Read(r, binary.BigEndian, &totalLen); err != nil {
+			break
+		}
+		if err := binary.Read(r, binary.BigEndian, &headerLen); err != nil {
+			break
+		}
+
+		if totalLen < 16 || headerLen > totalLen-16 || uint64(totalLen)-8 > uint64(r.Len()) {
+			break
+		}
+
+		// Skip the prelude CRC, which sits between the lengths and headers.
+		if _, err := r.Seek(4, io.SeekCurrent); err != nil {
+			break
+		}
+
+		header := make([]byte, int(headerLen))
+		if _, err := io.ReadFull(r, header); err != nil {
+			break
+		}
+
+		eventType := ""
+		for offset := 0; offset < len(header); {
+			nameLen := int(header[offset])
+			offset++
+			if nameLen > len(header)-offset-1 {
+				return frames
+			}
+
+			name := string(header[offset : offset+nameLen])
+			offset += nameLen
+			valueType := header[offset]
+			offset++
+
+			// Per the event-stream spec, only blob (6) and string (7) values carry
+			// a 2-byte length prefix; bool (0/1) has no value bytes and the rest
+			// are fixed-width: byte (2), short (3), integer (4), long (5),
+			// timestamp (8), uuid (9).
+			var valueLen int
+			switch valueType {
+			case 0, 1:
+				valueLen = 0
+			case 2:
+				valueLen = 1
+			case 3:
+				valueLen = 2
+			case 4:
+				valueLen = 4
+			case 5, 8:
+				valueLen = 8
+			case 9:
+				valueLen = 16
+			case 6, 7:
+				if len(header)-offset < 2 {
+					return frames
+				}
+				valueLen = int(binary.BigEndian.Uint16(header[offset : offset+2]))
+				offset += 2
+			default:
+				// Unknown value type: cannot know its width, so stop decoding.
+				return frames
+			}
+			if valueLen > len(header)-offset {
+				return frames
+			}
+
+			if name == ":event-type" && valueType == 7 {
+				eventType = string(header[offset : offset+valueLen])
+			}
+			offset += valueLen
+		}
+
+		payloadLen := int(totalLen - headerLen - 16)
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			break
+		}
+		if _, err := r.Seek(4, io.SeekCurrent); err != nil {
+			break
+		}
+
+		frames = append(frames, eventFrame{EventType: eventType, Payload: payload})
+	}
+
+	return frames
+}
+
 type SSEEvent struct {
 	Event string      `json:"event"`
 	Data  interface{} `json:"data"`
@@ -40,91 +146,149 @@ type ParseResult struct {
 }
 
 func ParseEvents(resp []byte) []SSEEvent {
-
 	events := []SSEEvent{}
-	startedTools := make(map[string]bool)  // Track which tool_use IDs have been started
-	toolIndexMap := make(map[string]int)   // Map tool_use ID to its index
+	startedTools := make(map[string]bool)    // Track which tool_use IDs have been started
+	toolIndexMap := make(map[string]int)     // Map tool_use ID to its index
 	thinkingToolIds := make(map[string]bool) // Track which tool IDs are thinking tools
-	nextToolIndex := 1                     // Next available index for tools (after text at 0; bumped to 2 if thinking appears)
-	lastContent := ""                      // Track last content for deduplication
-	hasThinking := false                   // Track if we've seen thinking blocks
-	textIndex := 0                         // Text index: 0 if no thinking, 1 if thinking present
-	tagParser := NewThinkingTagParser()    // Parser for <thinking> tags in text content
-	xmlParser := NewXmlToolParser()         // Parser for XML tool calls in text content
+	nextToolIndex := 1                       // Next available index for tools (after text at 0; bumped to 2 if thinking appears)
+	lastContent := ""                        // Track last content for deduplication
+	hasThinking := false                     // Track if we've seen thinking blocks
+	textIndex := 0                           // Text index: 0 if no thinking, 1 if thinking present
+	tagParser := NewThinkingTagParser()      // Parser for <thinking> tags in text content
+	xmlParser := NewXmlToolParser()          // Parser for XML tool calls in text content
+	reasoningOpen := false                   // A native reasoning block is currently open
+	reasoningSeen := false                   // At least one native reasoning block was emitted
+	reasoningIndex := 0                      // Index of the current native reasoning block
 
-	r := bytes.NewReader(resp)
-	for {
-		if r.Len() < 12 {
-			break
+	for _, frame := range decodeFrames(resp) {
+		switch frame.EventType {
+		case "reasoningContentEvent":
+			var evt reasoningContentEvent
+			if err := json.Unmarshal(frame.Payload, &evt); err != nil {
+				log.Println("json unmarshal error:", err)
+				continue
+			}
+			if debugEnabled() {
+				log.Printf("DEBUG ParseEvents: reasoning payload=%s", frame.Payload)
+			}
+
+			if !reasoningOpen {
+				// Reasoning can resume after text. A content block index may only
+				// be started once, so later runs get a fresh index instead of
+				// reopening the already-stopped block at index 0.
+				if reasoningSeen {
+					reasoningIndex = nextToolIndex
+					nextToolIndex++
+				} else {
+					reasoningIndex = 0
+					hasThinking = true
+					textIndex = 1
+					if nextToolIndex < 2 {
+						nextToolIndex = 2
+					}
+				}
+				events = append(events, SSEEvent{
+					Event: "content_block_start",
+					Data: map[string]interface{}{
+						"type":  "content_block_start",
+						"index": reasoningIndex,
+						"content_block": map[string]interface{}{
+							"type":     "thinking",
+							"thinking": "",
+						},
+					},
+				})
+				reasoningOpen = true
+				reasoningSeen = true
+			}
+			if evt.Text != "" {
+				events = append(events, SSEEvent{
+					Event: "content_block_delta",
+					Data: map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": reasoningIndex,
+						"delta": map[string]interface{}{
+							"type":     "thinking_delta",
+							"thinking": evt.Text,
+						},
+					},
+				})
+			}
+			if evt.Signature != "" {
+				events = append(events, SSEEvent{
+					Event: "content_block_delta",
+					Data: map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": reasoningIndex,
+						"delta": map[string]interface{}{
+							"type":      "signature_delta",
+							"signature": evt.Signature,
+						},
+					},
+				})
+			}
+			continue
+		case "initial-response", "metadataEvent", "contextUsageEvent", "meteringEvent":
+			if debugEnabled() {
+				log.Printf("DEBUG ParseEvents: ignoring %s payload=%s", frame.EventType, frame.Payload)
+			}
+			continue
+		case "assistantResponseEvent", "toolUseEvent", "":
+			// Parse through the existing assistant/tool path below.
+		default:
+			if debugEnabled() {
+				log.Printf("DEBUG ParseEvents: unknown event type %q, using assistant fallback", frame.EventType)
+			}
 		}
 
-		var totalLen, headerLen uint32
-		if err := binary.Read(r, binary.BigEndian, &totalLen); err != nil {
-			break
+		if reasoningOpen {
+			events = append(events, SSEEvent{
+				Event: "content_block_stop",
+				Data: map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": reasoningIndex,
+				},
+			})
+			reasoningOpen = false
 		}
-		if err := binary.Read(r, binary.BigEndian, &headerLen); err != nil {
-			break
-		}
-
-		if int(totalLen) > r.Len()+8 {
-			log.Println("Frame length invalid")
-			break
-		}
-
-		// Skip header
-		header := make([]byte, headerLen)
-		if _, err := io.ReadFull(r, header); err != nil {
-			break
-		}
-
-		payloadLen := int(totalLen) - int(headerLen) - 12
-		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			break
-		}
-
-		// Skip CRC32
-		if _, err := r.Seek(4, io.SeekCurrent); err != nil {
-			break
-		}
-
-		payloadStr := strings.TrimPrefix(string(payload), "vent")
 
 		var evt assistantResponseEvent
-		if err := json.Unmarshal([]byte(payloadStr), &evt); err == nil {
-			// Debug log: show all parsed events when DEBUG_SAVE_RAW is enabled
+		if err := json.Unmarshal(frame.Payload, &evt); err == nil {
 			if debugEnabled() {
-				log.Printf("DEBUG ParseEvents: raw payload=%s", payloadStr)
+				log.Printf("DEBUG ParseEvents: raw payload=%s", frame.Payload)
 				log.Printf("DEBUG ParseEvents: parsed event Content=%q, ToolUseId=%q, Name=%q, Stop=%v, Input=%v",
 					evt.Content, evt.ToolUseId, evt.Name, evt.Stop, evt.Input)
 			}
 
-			// Convert event to SSE, tracking started tools to avoid duplicate starts
-			// Also track content for deduplication
 			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex, tagParser, xmlParser)
 			events = append(events, sseEvents...)
 
-			// Add message_delta for tool_use stop, but skip for thinking tools
-			// Thinking tools are converted to thinking content blocks, not tool_use
-			if evt.ToolUseId != "" && evt.Name != "" && evt.Name != "thinking" {
-				if evt.Stop {
-					events = append(events, SSEEvent{
-						Event: "message_delta",
-						Data: map[string]interface{}{
-							"type": "message_delta",
-							"delta": map[string]interface{}{
-								"stop_reason":   "tool_use",
-								"stop_sequence": nil,
-							},
-							"usage": map[string]interface{}{"output_tokens": 0},
+			if evt.ToolUseId != "" && evt.Name != "" && evt.Name != "thinking" && evt.Stop {
+				events = append(events, SSEEvent{
+					Event: "message_delta",
+					Data: map[string]interface{}{
+						"type": "message_delta",
+						"delta": map[string]interface{}{
+							"stop_reason":   "tool_use",
+							"stop_sequence": nil,
 						},
-					})
-				}
-
+						"usage": map[string]interface{}{"output_tokens": 0},
+					},
+				})
 			}
 		} else {
 			log.Println("json unmarshal error:", err)
 		}
+	}
+
+	if reasoningOpen {
+		events = append(events, SSEEvent{
+			Event: "content_block_stop",
+			Data: map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": reasoningIndex,
+			},
+		})
 	}
 
 	// Flush XML tool parser - emit any remaining buffered content
@@ -376,8 +540,8 @@ func emitXmlToolEvents(tc XmlToolCall, startedTools map[string]bool, nextToolInd
 		events = append(events, SSEEvent{
 			Event: "content_block_start",
 			Data: map[string]interface{}{
-				"type":  "content_block_start",
-				"index": textIndex,
+				"type":          "content_block_start",
+				"index":         textIndex,
 				"content_block": map[string]interface{}{"type": "text", "text": ""},
 			},
 		})
@@ -522,8 +686,8 @@ func convertAssistantEventWithTracking(evt assistantResponseEvent, startedTools 
 			events = append(events, SSEEvent{
 				Event: "content_block_start",
 				Data: map[string]interface{}{
-					"type":  "content_block_start",
-					"index": *textIndex,
+					"type":          "content_block_start",
+					"index":         *textIndex,
 					"content_block": map[string]interface{}{"type": "text", "text": ""},
 				},
 			})
@@ -616,106 +780,169 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 	startedTools := make(map[string]bool)
 	toolIndexMap := make(map[string]int)
 	thinkingToolIds := make(map[string]bool)
-	nextToolIndex := 1      // Next available index for tools (after text at 0; bumped to 2 if thinking appears)
+	nextToolIndex := 1 // Next available index for tools (after text at 0; bumped to 2 if thinking appears)
 	lastContent := ""
-	hasThinking := false    // Track if we've seen thinking blocks
-	textIndex := 0          // Text index: 0 if no thinking, 1 if thinking present
+	hasThinking := false                // Track if we've seen thinking blocks
+	textIndex := 0                      // Text index: 0 if no thinking, 1 if thinking present
 	tagParser := NewThinkingTagParser() // Parser for <thinking> tags in text content
-	xmlParser := NewXmlToolParser()      // Parser for XML tool calls in text content
+	xmlParser := NewXmlToolParser()     // Parser for XML tool calls in text content
+	reasoningOpen := false              // A native reasoning block is currently open
+	reasoningSeen := false              // At least one native reasoning block was emitted
+	reasoningIndex := 0                 // Index of the current native reasoning block
 
 	// Track thinking input fragments to accumulate full content
 	var thinkingInputBuilder strings.Builder
 
-	r := bytes.NewReader(resp)
-	for {
-		if r.Len() < 12 {
-			break
-		}
-
-		var totalLen, headerLen uint32
-		if err := binary.Read(r, binary.BigEndian, &totalLen); err != nil {
-			break
-		}
-		if err := binary.Read(r, binary.BigEndian, &headerLen); err != nil {
-			break
-		}
-
-		if int(totalLen) > r.Len()+8 {
-			log.Println("Frame length invalid")
-			break
-		}
-
-		header := make([]byte, headerLen)
-		if _, err := io.ReadFull(r, header); err != nil {
-			break
-		}
-
-		payloadLen := int(totalLen) - int(headerLen) - 12
-		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			break
-		}
-
-		if _, err := r.Seek(4, io.SeekCurrent); err != nil {
-			break
-		}
-
-		payloadStr := strings.TrimPrefix(string(payload), "vent")
-
-		var evt assistantResponseEvent
-		if err := json.Unmarshal([]byte(payloadStr), &evt); err == nil {
+	for _, frame := range decodeFrames(resp) {
+		switch frame.EventType {
+		case "reasoningContentEvent":
+			var evt reasoningContentEvent
+			if err := json.Unmarshal(frame.Payload, &evt); err != nil {
+				log.Println("json unmarshal error:", err)
+				continue
+			}
 			if debugEnabled() {
-				log.Printf("DEBUG ParseEventsWithThinking: raw payload=%s", payloadStr)
+				log.Printf("DEBUG ParseEventsWithThinking: reasoning payload=%s", frame.Payload)
 			}
 
-			// Track thinking tool ID and accumulate input
+			if !reasoningOpen {
+				// Reasoning can resume after text. A content block index may only
+				// be started once, so later runs get a fresh index instead of
+				// reopening the already-stopped block at index 0.
+				if reasoningSeen {
+					reasoningIndex = nextToolIndex
+					nextToolIndex++
+				} else {
+					reasoningIndex = 0
+					hasThinking = true
+					textIndex = 1
+					if nextToolIndex < 2 {
+						nextToolIndex = 2
+					}
+				}
+				result.Events = append(result.Events, SSEEvent{
+					Event: "content_block_start",
+					Data: map[string]interface{}{
+						"type":  "content_block_start",
+						"index": reasoningIndex,
+						"content_block": map[string]interface{}{
+							"type":     "thinking",
+							"thinking": "",
+						},
+					},
+				})
+				reasoningOpen = true
+				reasoningSeen = true
+			}
+			if evt.Text != "" {
+				result.Events = append(result.Events, SSEEvent{
+					Event: "content_block_delta",
+					Data: map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": reasoningIndex,
+						"delta": map[string]interface{}{
+							"type":     "thinking_delta",
+							"thinking": evt.Text,
+						},
+					},
+				})
+			}
+			if evt.Signature != "" {
+				result.Events = append(result.Events, SSEEvent{
+					Event: "content_block_delta",
+					Data: map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": reasoningIndex,
+						"delta": map[string]interface{}{
+							"type":      "signature_delta",
+							"signature": evt.Signature,
+						},
+					},
+				})
+			}
+			continue
+		case "initial-response", "metadataEvent", "contextUsageEvent", "meteringEvent":
+			if debugEnabled() {
+				log.Printf("DEBUG ParseEventsWithThinking: ignoring %s payload=%s", frame.EventType, frame.Payload)
+			}
+			continue
+		case "assistantResponseEvent", "toolUseEvent", "":
+			// Parse through the existing assistant/tool path below.
+		default:
+			if debugEnabled() {
+				log.Printf("DEBUG ParseEventsWithThinking: unknown event type %q, using assistant fallback", frame.EventType)
+			}
+		}
+
+		if reasoningOpen {
+			result.Events = append(result.Events, SSEEvent{
+				Event: "content_block_stop",
+				Data: map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": reasoningIndex,
+				},
+			})
+			reasoningOpen = false
+		}
+
+		var evt assistantResponseEvent
+		if err := json.Unmarshal(frame.Payload, &evt); err == nil {
+			if debugEnabled() {
+				log.Printf("DEBUG ParseEventsWithThinking: raw payload=%s", frame.Payload)
+			}
+
+			// Track thinking tool ID and accumulate input. Native reasoning events
+			// deliberately never set these continuation fields.
 			if evt.Name == "thinking" {
 				if result.ThinkingToolId == "" && evt.ToolUseId != "" {
 					result.ThinkingToolId = evt.ToolUseId
 				}
 				thinkingToolIds[evt.ToolUseId] = true
 
-				// Accumulate thinking input (raw, for sending back in continuation)
 				if evt.Input != nil && *evt.Input != "" {
 					thinkingInputBuilder.WriteString(*evt.Input)
 				}
 			} else if evt.ToolUseId != "" && thinkingToolIds[evt.ToolUseId] {
-				// Stop event for thinking tool
 				if evt.Input != nil && *evt.Input != "" {
 					thinkingInputBuilder.WriteString(*evt.Input)
 				}
 			} else if evt.ToolUseId != "" && evt.Name != "" && evt.Name != "thinking" {
-				// Regular (non-thinking) tool detected
 				result.HasRegularTools = true
 			}
 
 			sseEvents := convertAssistantEventWithTracking(evt, startedTools, toolIndexMap, thinkingToolIds, &nextToolIndex, &lastContent, &hasThinking, &textIndex, tagParser, xmlParser)
 			result.Events = append(result.Events, sseEvents...)
 
-			// Check if XML tool parser detected tool calls (sets HasRegularTools)
 			if xmlParser.hasDetectedTools {
 				result.HasRegularTools = true
 			}
 
-			// Add message_delta for non-thinking tool_use stop
-			if evt.ToolUseId != "" && evt.Name != "" && evt.Name != "thinking" {
-				if evt.Stop {
-					result.Events = append(result.Events, SSEEvent{
-						Event: "message_delta",
-						Data: map[string]interface{}{
-							"type": "message_delta",
-							"delta": map[string]interface{}{
-								"stop_reason":   "tool_use",
-								"stop_sequence": nil,
-							},
-							"usage": map[string]interface{}{"output_tokens": 0},
+			if evt.ToolUseId != "" && evt.Name != "" && evt.Name != "thinking" && evt.Stop {
+				result.Events = append(result.Events, SSEEvent{
+					Event: "message_delta",
+					Data: map[string]interface{}{
+						"type": "message_delta",
+						"delta": map[string]interface{}{
+							"stop_reason":   "tool_use",
+							"stop_sequence": nil,
 						},
-					})
-				}
+						"usage": map[string]interface{}{"output_tokens": 0},
+					},
+				})
 			}
 		} else {
 			log.Println("json unmarshal error:", err)
 		}
+	}
+
+	if reasoningOpen {
+		result.Events = append(result.Events, SSEEvent{
+			Event: "content_block_stop",
+			Data: map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": reasoningIndex,
+			},
+		})
 	}
 
 	// Flush XML tool parser - emit any remaining buffered content
@@ -732,19 +959,16 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 	// Input format: {"thought": "actual content here"}
 	rawInput := thinkingInputBuilder.String()
 	if rawInput != "" {
-		// Try to parse as JSON to extract thought field
 		var thinkingJSON map[string]string
 		if err := json.Unmarshal([]byte(rawInput), &thinkingJSON); err == nil {
 			if thought, ok := thinkingJSON["thought"]; ok {
 				result.ThinkingInput = thought
 			}
 		} else {
-			// Fallback: store raw input
 			result.ThinkingInput = rawInput
 		}
 	}
 
-	// Set text index and thinking flag in result
 	result.TextIndex = textIndex
 	result.HasThinking = hasThinking
 
