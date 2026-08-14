@@ -512,8 +512,11 @@ type ToolSpecification struct {
 }
 
 // CodeWhispererTool 表示 CodeWhisperer API 的工具结构
+// Mirrors the Rust client's Tool union: either a toolSpecification or a
+// cachePoint variant (used to mark the stable tools prefix as cacheable).
 type CodeWhispererTool struct {
-	ToolSpecification ToolSpecification `json:"toolSpecification"`
+	ToolSpecification *ToolSpecification `json:"toolSpecification,omitempty"`
+	CachePoint        *CachePoint        `json:"cachePoint,omitempty"`
 }
 
 // HistoryUserMessage 表示历史记录中的用户消息
@@ -523,6 +526,7 @@ type HistoryUserMessage struct {
 		UserInputMessageContext *HistoryUserInputMessageContext `json:"userInputMessageContext,omitempty"`
 		Origin                  string                          `json:"origin,omitempty"`
 		Images                  []KiroImage                     `json:"images,omitempty"`
+		CachePoint              *CachePoint                     `json:"cachePoint,omitempty"`
 	} `json:"userInputMessage"`
 }
 
@@ -880,6 +884,38 @@ type EnvState struct {
 // (mirrors amzn-codewhisperer-streaming-client's CachePoint; only "default").
 type CachePoint struct {
 	Type string `json:"type"`
+}
+
+// contentFilterFallbackModel maps models whose safety classifiers filter
+// aggressively to a laxer fallback model, mirroring Anthropic's official
+// automatic-fallback behavior (flagged Opus 5 / Fable 5 requests route to
+// Opus 4.8, whose classifiers intervene ~85% less often).
+var contentFilterFallbackModel = map[string]string{
+	"claude-fable-5": "claude-opus-4.8",
+	"claude-opus-5":  "claude-opus-4.8",
+}
+
+// retryContentFiltered tries to recover from an upstream CONTENT_FILTERED
+// response: one same-model retry first (the filter is probabilistic), then
+// one shot on the fallback model. accepted validates a candidate body.
+func retryContentFiltered(cwReq CodeWhispererRequest, accessToken string, accepted func([]byte) bool) ([]byte, bool) {
+	log.Printf("CONTENT_FILTERED，同模型重试一次...")
+	if body, err := sendQApiRequest(cwReq, accessToken); err == nil && accepted(body) {
+		log.Printf("CONTENT_FILTERED 重试成功")
+		return body, true
+	}
+	fb := contentFilterFallbackModel[cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId]
+	if fb == "" {
+		return nil, false
+	}
+	log.Printf("CONTENT_FILTERED 重试仍被过滤，降级到 %s ...", fb)
+	fbReq := cwReq
+	fbReq.ConversationState.CurrentMessage.UserInputMessage.ModelId = fb
+	if body, err := sendQApiRequest(fbReq, accessToken); err == nil && accepted(body) {
+		log.Printf("CONTENT_FILTERED 降级到 %s 成功", fb)
+		return body, true
+	}
+	return nil, false
 }
 
 // promptCachingModels lists models with supportsPromptCaching per
@@ -1402,13 +1438,11 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 	// 处理 tools 信息
 	var tools []CodeWhispererTool
 	for _, tool := range anthropicReq.Tools {
-		cwTool := CodeWhispererTool{}
-		cwTool.ToolSpecification.Name = tool.Name
-		cwTool.ToolSpecification.Description = tool.Description
-		cwTool.ToolSpecification.InputSchema = InputSchema{
-			Json: sanitizeJsonSchema(tool.InputSchema),
-		}
-		tools = append(tools, cwTool)
+		tools = append(tools, CodeWhispererTool{ToolSpecification: &ToolSpecification{
+			Name:        tool.Name,
+			Description: tool.Description,
+			InputSchema: InputSchema{Json: sanitizeJsonSchema(tool.InputSchema)},
+		}})
 	}
 
 	// Forward thinking config and effort natively for models that support
@@ -1430,7 +1464,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 			effort = anthropicReq.OutputConfig.Effort
 		}
 		log.Printf("Thinking enabled: type=%s display=%s budget_tokens=%d effort=%s; adding thinking tool", anthropicReq.Thinking.Type, anthropicReq.Thinking.Display, anthropicReq.Thinking.BudgetTokens, effort)
-		thinkingTool := CodeWhispererTool{}
+		thinkingTool := CodeWhispererTool{ToolSpecification: &ToolSpecification{}}
 		thinkingTool.ToolSpecification.Name = "thinking"
 		thinkingTool.ToolSpecification.Description = "Thinking is an internal reasoning mechanism improving the quality of complex tasks by breaking their atomic actions down; use it specifically for multi-step problems requiring step-by-step dependencies, reasoning through multiple constraints, synthesizing results from previous tool calls, planning intricate sequences of actions, troubleshooting complex errors, or making decisions involving multiple trade-offs. Avoid using it for straightforward tasks, basic information retrieval, summaries, always clearly define the reasoning challenge, structure thoughts explicitly, consider multiple perspectives, and summarize key insights before important decisions or complex tool interactions."
 		thinkingTool.ToolSpecification.InputSchema = InputSchema{
@@ -1449,6 +1483,12 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 	}
 
 	if len(tools) > 0 {
+		// Multi-checkpoint caching: tools are the largest stable prefix, so
+		// mark them with their own cache point (Tool union CachePoint variant;
+		// schema allows up to 4 checkpoints per request).
+		if promptCachingModels[modelId] > 0 {
+			tools = append(tools, CodeWhispererTool{CachePoint: &CachePoint{Type: "default"}})
+		}
 		cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools = tools
 	}
 
@@ -1782,6 +1822,19 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 		history = ensureAssistantBeforeToolResults(history)
 		history = ensureFirstMessageIsUser(history)
 		history = ensureAlternatingRoles(history)
+
+		// Multi-checkpoint caching: mark the last history user message so the
+		// previous turn's prefix stays cached even when the current message
+		// changes (checkpoints so far: tools + this + current message ≤ 4).
+		if promptCachingModels[modelId] > 0 {
+			for i := len(history) - 1; i >= 0; i-- {
+				if um, ok := history[i].(HistoryUserMessage); ok {
+					um.UserInputMessage.CachePoint = &CachePoint{Type: "default"}
+					history[i] = um
+					break
+				}
+			}
+		}
 
 		cwReq.ConversationState.History = history
 
@@ -3584,16 +3637,14 @@ processResponse:
 	parseResult := parser.ParseEventsWithThinking(respBody)
 
 	if parseResult.Refusal != "" && len(parseResult.Events) == 0 {
-		// The filter is probabilistic (same request may pass on retry), so try
-		// once more before surfacing the refusal.
-		log.Printf("CONTENT_FILTERED，重试一次...")
-		if retryBody, retryErr := sendQApiRequest(cwReq, accessToken); retryErr == nil {
-			retryResult := parser.ParseEventsWithThinking(retryBody)
-			if retryResult.Refusal == "" && len(retryResult.Events) > 0 {
-				log.Printf("CONTENT_FILTERED 重试成功")
-				respBody = retryBody
-				parseResult = retryResult
-			}
+		// Recover: same-model retry (filter is probabilistic), then fallback
+		// model, mirroring Anthropic's automatic-fallback behavior.
+		if body, ok := retryContentFiltered(cwReq, accessToken, func(b []byte) bool {
+			r := parser.ParseEventsWithThinking(b)
+			return r.Refusal == "" && len(r.Events) > 0
+		}); ok {
+			respBody = body
+			parseResult = parser.ParseEventsWithThinking(respBody)
 		}
 	}
 
@@ -3923,17 +3974,14 @@ processNonStreamResponse:
 	events := parser.ParseEvents(cwRespBody)
 
 	if refusal := parser.DetectRefusal(cwRespBody); refusal != "" && len(events) == 0 {
-		// The filter is probabilistic; retry once before surfacing the refusal.
-		log.Printf("CONTENT_FILTERED (非流式)，重试一次...")
-		if retryBody, retryErr := sendQApiRequest(cwReq, accessToken); retryErr == nil {
-			retryEvents := parser.ParseEvents(retryBody)
-			if parser.DetectRefusal(retryBody) == "" && len(retryEvents) > 0 {
-				log.Printf("CONTENT_FILTERED 重试成功 (非流式)")
-				cwRespBody = retryBody
-				respBodyStr = string(cwRespBody)
-				events = retryEvents
-				refusal = ""
-			}
+		// Recover: same-model retry, then fallback model.
+		if body, ok := retryContentFiltered(cwReq, accessToken, func(b []byte) bool {
+			return parser.DetectRefusal(b) == "" && len(parser.ParseEvents(b)) > 0
+		}); ok {
+			cwRespBody = body
+			respBodyStr = string(cwRespBody)
+			events = parser.ParseEvents(cwRespBody)
+			refusal = ""
 		}
 		if refusal != "" {
 			// Content filter swallowed the whole response; surface the refusal
