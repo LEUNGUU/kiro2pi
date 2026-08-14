@@ -857,6 +857,7 @@ type CodeWhispererRequest struct {
 				Origin                       string         `json:"origin"`
 				Images                       []KiroImage    `json:"images,omitempty"`
 				AdditionalModelRequestFields map[string]any `json:"additionalModelRequestFields,omitempty"`
+				CachePoint                   *CachePoint    `json:"cachePoint,omitempty"`
 				UserInputMessageContext      struct {
 					ToolResults []map[string]any    `json:"toolResults,omitempty"`
 					Tools       []CodeWhispererTool `json:"tools,omitempty"`
@@ -873,6 +874,28 @@ type CodeWhispererRequest struct {
 type EnvState struct {
 	OperatingSystem         string `json:"operatingSystem"`
 	CurrentWorkingDirectory string `json:"currentWorkingDirectory"`
+}
+
+// CachePoint marks a prompt-caching checkpoint in the request
+// (mirrors amzn-codewhisperer-streaming-client's CachePoint; only "default").
+type CachePoint struct {
+	Type string `json:"type"`
+}
+
+// promptCachingModels lists models with supportsPromptCaching per
+// ListAvailableModels, mapped to minimumTokensPerCacheCheckpoint.
+var promptCachingModels = map[string]int{
+	"claude-opus-5":     1024,
+	"claude-sonnet-5":   1024,
+	"claude-opus-4.8":   1024,
+	"claude-opus-4.7":   4096,
+	"claude-opus-4.6":   4096,
+	"claude-sonnet-4.6": 1024,
+	"claude-fable-5":    4096,
+	"gpt-5.6-sol":       1024,
+	"gpt-5.6-terra":     1024,
+	"gpt-5.6-luna":      1024,
+	"auto":              1024,
 }
 
 // goosToQApi maps Go's runtime.GOOS to Q API accepted operatingSystem values.
@@ -901,15 +924,16 @@ type CodeWhispererEvent struct {
 
 // Models that accept additionalModelRequestFields with thinking/output_config
 // (adaptive-thinking Claude models, per additionalModelRequestFieldsSchema
-// from the ListAvailableModels management API).
-var adaptiveThinkingModels = map[string]bool{
-	"claude-opus-5":     true,
-	"claude-sonnet-5":   true,
-	"claude-opus-4.8":   true,
-	"claude-opus-4.7":   true,
-	"claude-opus-4.6":   true,
-	"claude-sonnet-4.6": true,
-	"claude-fable-5":    true,
+// from the ListAvailableModels management API). Value is the schema's
+// max_tokens maximum for the model.
+var adaptiveThinkingModels = map[string]int{
+	"claude-opus-5":     128000,
+	"claude-sonnet-5":   128000,
+	"claude-opus-4.8":   128000,
+	"claude-opus-4.7":   128000,
+	"claude-opus-4.6":   64000,
+	"claude-sonnet-4.6": 64000,
+	"claude-fable-5":    128000,
 }
 
 // Models that accept additionalModelRequestFields with reasoning.effort (GPT models).
@@ -928,7 +952,7 @@ func buildAdditionalModelRequestFields(modelId string, req AnthropicRequest) map
 		effort = req.OutputConfig.Effort
 	}
 	switch {
-	case adaptiveThinkingModels[modelId]:
+	case adaptiveThinkingModels[modelId] > 0:
 		fields := map[string]any{}
 		if req.Thinking != nil {
 			switch req.Thinking.Type {
@@ -947,6 +971,19 @@ func buildAdditionalModelRequestFields(modelId string, req AnthropicRequest) map
 		switch effort {
 		case "low", "medium", "high", "xhigh", "max":
 			fields["output_config"] = map[string]any{"effort": effort}
+		}
+		// Forward max_tokens clamped to the schema range [1024, model max].
+		// Note: verified 2026-08 that upstream accepts but does not yet enforce
+		// this value (output is not truncated); forwarded for forward-compat.
+		if req.MaxTokens > 0 {
+			mt := req.MaxTokens
+			if mt < 1024 {
+				mt = 1024
+			}
+			if limit := adaptiveThinkingModels[modelId]; mt > limit {
+				mt = limit
+			}
+			fields["max_tokens"] = mt
 		}
 		if len(fields) == 0 {
 			return nil
@@ -976,7 +1013,6 @@ var ModelMap = map[string]string{
 	"claude-opus-5":     "claude-opus-5",
 	"minimax-m2.5":      "minimax-m2.5",
 	"glm-5":             "glm-5",
-	"kimi-k2.5":         "kimi-k2.5",
 	"gpt-5.6-sol":       "gpt-5.6-sol",
 	"gpt-5.6-terra":     "gpt-5.6-terra",
 	"gpt-5.6-luna":      "gpt-5.6-luna",
@@ -987,7 +1023,6 @@ var ModelMap = map[string]string{
 	"claude-opus-4-8":   "claude-opus-4.8",
 	"claude-sonnet-4-6": "claude-sonnet-4.6",
 	"minimax-m2-5":      "minimax-m2.5",
-	"kimi-k2-5":         "kimi-k2.5",
 	"gpt-5-6-sol":       "gpt-5.6-sol",
 	"gpt-5-6-terra":     "gpt-5.6-terra",
 	"gpt-5-6-luna":      "gpt-5.6-luna",
@@ -1320,6 +1355,12 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 	// Use KIRO_CLI origin like kiro-cli does
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.Origin = "KIRO_CLI"
 
+	// Prompt caching: models that support it get a checkpoint on the current
+	// message so the (potentially huge) conversation prefix is cached upstream.
+	if promptCachingModels[modelId] > 0 {
+		cwReq.ConversationState.CurrentMessage.UserInputMessage.CachePoint = &CachePoint{Type: "default"}
+	}
+
 	// cwd extraction for history messages
 	cwd := extractCwdFromSystemPrompt(anthropicReq.System)
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.EnvState = &EnvState{
@@ -1351,7 +1392,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 
 	// Add thinking tool when thinking is enabled (matching kiro-cli behavior)
 	// for models WITHOUT native additionalModelRequestFields support.
-	if !adaptiveThinkingModels[modelId] && !reasoningEffortModels[modelId] &&
+	if !(adaptiveThinkingModels[modelId] > 0) && !reasoningEffortModels[modelId] &&
 		anthropicReq.Thinking != nil && (anthropicReq.Thinking.Type == "enabled" || anthropicReq.Thinking.Type == "adaptive") {
 		effort := ""
 		if anthropicReq.OutputConfig != nil {
@@ -3475,6 +3516,13 @@ processResponse:
 	// Use ParseEventsWithThinking for automatic thinking continuation
 	parseResult := parser.ParseEventsWithThinking(respBody)
 
+	if parseResult.Refusal != "" && len(parseResult.Events) == 0 {
+		// Upstream content filter swallowed the whole response; surface the
+		// refusal instead of an empty/broken stream.
+		sendErrorEvent(w, flusher, "Upstream refused the request", fmt.Errorf("%s", parseResult.Refusal))
+		return
+	}
+
 	if len(parseResult.Events) == 0 {
 		// No events parsed - send an error response instead of a broken stream
 		sendErrorEvent(w, flusher, "Empty response from upstream API", fmt.Errorf("no events parsed from response (%d bytes)", len(respBody)))
@@ -3779,6 +3827,22 @@ processNonStreamResponse:
 	respBodyStr := string(cwRespBody)
 
 	events := parser.ParseEvents(cwRespBody)
+
+	if refusal := parser.DetectRefusal(cwRespBody); refusal != "" && len(events) == 0 {
+		// Content filter swallowed the whole response; surface the refusal
+		// instead of returning an empty message.
+		log.Printf("Upstream CONTENT_FILTERED (non-stream): %s", refusal)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "invalid_request_error",
+				"message": refusal,
+			},
+		})
+		return
+	}
 
 	context := ""
 	toolName := ""

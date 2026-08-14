@@ -433,3 +433,30 @@ func TestDecodeFramesTruncated(t *testing.T) {
 		ParseEventsWithThinking(prefix)
 	}
 }
+
+// TestContentFilteredRefusal covers the CONTENT_FILTERED metadataEvent observed
+// on claude-fable-5 with large inputs: upstream returns 200 with no assistant
+// frames and buries the refusal in stopDetails.
+func TestContentFilteredRefusal(t *testing.T) {
+	payload := `{"stopDetails":{"refusal":{"category":"CYBER","explanation":"The selected model cannot continue this conversation."}},"stopReason":"CONTENT_FILTERED"}`
+	resp := encodeTypedFrame("initial-response", `{"conversationId":""}`)
+	resp = append(resp, encodeTypedFrame("metadataEvent", payload)...)
+
+	result := ParseEventsWithThinking(resp)
+	if len(result.Events) != 0 {
+		t.Errorf("expected no events, got %d", len(result.Events))
+	}
+	if !strings.Contains(result.Refusal, "CYBER") || !strings.Contains(result.Refusal, "cannot continue") {
+		t.Errorf("refusal not extracted: %q", result.Refusal)
+	}
+
+	if got := DetectRefusal(resp); got != result.Refusal {
+		t.Errorf("DetectRefusal mismatch: %q vs %q", got, result.Refusal)
+	}
+
+	// A normal metadataEvent (no refusal) must not set Refusal.
+	normal := encodeTypedFrame("metadataEvent", `{"stopReason":"end_turn"}`)
+	if got := DetectRefusal(normal); got != "" {
+		t.Errorf("false positive refusal: %q", got)
+	}
+}

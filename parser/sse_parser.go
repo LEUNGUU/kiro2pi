@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -143,6 +144,53 @@ type ParseResult struct {
 	HasRegularTools bool   // True if response contains non-thinking tool calls
 	TextIndex       int    // Index used for text content blocks (0 if no thinking, 1 if thinking present)
 	HasThinking     bool   // True if response contains thinking blocks
+	Refusal         string // Non-empty if upstream stopped with CONTENT_FILTERED; holds the refusal explanation
+}
+
+// metadataStopDetails mirrors the metadataEvent payload carrying refusal info:
+// {"stopDetails":{"refusal":{"category":"CYBER","explanation":"..."}},"stopReason":"CONTENT_FILTERED"}
+type metadataStopDetails struct {
+	StopReason  string `json:"stopReason"`
+	StopDetails struct {
+		Refusal struct {
+			Category    string `json:"category"`
+			Explanation string `json:"explanation"`
+		} `json:"refusal"`
+	} `json:"stopDetails"`
+}
+
+// parseRefusal extracts a human-readable refusal message from a metadataEvent
+// payload, or "" if the event does not indicate content filtering.
+func parseRefusal(payload []byte) string {
+	var md metadataStopDetails
+	if err := json.Unmarshal(payload, &md); err != nil {
+		return ""
+	}
+	if md.StopReason != "CONTENT_FILTERED" {
+		return ""
+	}
+	msg := md.StopDetails.Refusal.Explanation
+	if msg == "" {
+		msg = "Upstream content filter blocked this response."
+	}
+	if c := md.StopDetails.Refusal.Category; c != "" {
+		msg = fmt.Sprintf("[content filter: %s] %s", c, msg)
+	}
+	return msg
+}
+
+// DetectRefusal scans a raw event-stream response for a metadataEvent with
+// stopReason CONTENT_FILTERED and returns the refusal message, or "".
+func DetectRefusal(resp []byte) string {
+	for _, frame := range decodeFrames(resp) {
+		if frame.EventType != "metadataEvent" {
+			continue
+		}
+		if r := parseRefusal(frame.Payload); r != "" {
+			return r
+		}
+	}
+	return ""
 }
 
 func ParseEvents(resp []byte) []SSEEvent {
@@ -861,7 +909,13 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 				})
 			}
 			continue
-		case "initial-response", "metadataEvent", "contextUsageEvent", "meteringEvent":
+		case "metadataEvent":
+			if r := parseRefusal(frame.Payload); r != "" {
+				result.Refusal = r
+				log.Printf("Upstream CONTENT_FILTERED: %s", r)
+			}
+			continue
+		case "initial-response", "contextUsageEvent", "meteringEvent":
 			if debugEnabled() {
 				log.Printf("DEBUG ParseEventsWithThinking: ignoring %s payload=%s", frame.EventType, frame.Payload)
 			}

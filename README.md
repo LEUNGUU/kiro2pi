@@ -272,7 +272,10 @@ No full request/response bodies are stored. Use `DEBUG_SAVE_RAW=1` for raw respo
 
 ## Known Limitations
 
-- Q API has a ~590KB request payload hard limit, which caps effective context at ~128K tokens (set `contextWindow: 128000` in models.json)
+- Q API request payload hard limit is ~1.9MB for Claude/GPT models and ~600KB for minimax/glm (measured 2026-08). With the ~4 chars/token heuristic this caps effective context at roughly 480K/150K tokens respectively — still below the 1M-token window advertised for opus-5/sonnet-5/fable-5
+- claude-fable-5 (experimental preview) runs an aggressive content filter: large inputs (~280K+ tokens, lower for code-heavy content) may return 200 with `stopReason: CONTENT_FILTERED` and no output. The proxy surfaces this as an explicit error. Other Claude/GPT models are not affected
+- `max_tokens` is forwarded via `additionalModelRequestFields` for adaptive Claude models, but upstream currently accepts without enforcing it (output is not truncated)
+- A `cachePoint` checkpoint is set on the current message for prompt-caching-capable models; the API accepts it but exposes no cache usage metrics, so the benefit cannot be confirmed client-side
 - Input token counts are estimated (chars/4 heuristic)
 - URL-based image sources are not supported (only base64)
 - `output_config.effort` and `thinking` are forwarded natively via `additionalModelRequestFields` for models whose `ListAvailableModels` schema supports it (adaptive Claude models: opus-5, sonnet-5, fable-5, opus-4.6/4.7/4.8, sonnet-4.6; GPT models map effort to `reasoning.effort`). Older models fall back to the synthetic thinking tool and ignore effort.
