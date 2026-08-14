@@ -552,21 +552,27 @@ type HistoryAssistantMessage struct {
 
 // AnthropicThinking represents the thinking configuration in Anthropic API
 type AnthropicThinking struct {
-	Type         string `json:"type"`                    // "enabled" or "disabled"
+	Type         string `json:"type"`                    // "enabled", "disabled", or "adaptive"
 	BudgetTokens int    `json:"budget_tokens,omitempty"` // Token budget for thinking
+	Display      string `json:"display,omitempty"`       // Display mode for adaptive thinking
+}
+
+type AnthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 // AnthropicRequest 表示 Anthropic API 的请求结构
 type AnthropicRequest struct {
-	Model       string                    `json:"model"`
-	MaxTokens   int                       `json:"max_tokens"`
-	Messages    []AnthropicRequestMessage `json:"messages"`
-	System      FlexibleSystem            `json:"system,omitempty"`
-	Tools       []AnthropicTool           `json:"tools,omitempty"`
-	Stream      bool                      `json:"stream"`
-	Temperature *float64                  `json:"temperature,omitempty"`
-	Metadata    map[string]any            `json:"metadata,omitempty"`
-	Thinking    *AnthropicThinking        `json:"thinking,omitempty"` // Extended thinking support
+	Model        string                    `json:"model"`
+	MaxTokens    int                       `json:"max_tokens"`
+	Messages     []AnthropicRequestMessage `json:"messages"`
+	System       FlexibleSystem            `json:"system,omitempty"`
+	Tools        []AnthropicTool           `json:"tools,omitempty"`
+	Stream       bool                      `json:"stream"`
+	Temperature  *float64                  `json:"temperature,omitempty"`
+	Metadata     map[string]any            `json:"metadata,omitempty"`
+	Thinking     *AnthropicThinking        `json:"thinking,omitempty"`      // Extended thinking support
+	OutputConfig *AnthropicOutputConfig    `json:"output_config,omitempty"` // Accepted for compatibility; Q API cannot forward effort
 }
 
 // AnthropicStreamResponse 表示 Anthropic 流式响应的结构
@@ -1275,7 +1281,11 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 	// Add thinking tool when thinking is enabled (matching kiro-cli behavior)
 	// The Q API implements thinking as a tool, not as a native parameter
 	if anthropicReq.Thinking != nil && (anthropicReq.Thinking.Type == "enabled" || anthropicReq.Thinking.Type == "adaptive") {
-		log.Printf("Thinking enabled with budget_tokens=%d, adding thinking tool", anthropicReq.Thinking.BudgetTokens)
+		effort := ""
+		if anthropicReq.OutputConfig != nil {
+			effort = anthropicReq.OutputConfig.Effort
+		}
+		log.Printf("Thinking enabled: type=%s display=%s budget_tokens=%d effort=%s; adding thinking tool", anthropicReq.Thinking.Type, anthropicReq.Thinking.Display, anthropicReq.Thinking.BudgetTokens, effort)
 		thinkingTool := CodeWhispererTool{}
 		thinkingTool.ToolSpecification.Name = "thinking"
 		thinkingTool.ToolSpecification.Description = "Thinking is an internal reasoning mechanism improving the quality of complex tasks by breaking their atomic actions down; use it specifically for multi-step problems requiring step-by-step dependencies, reasoning through multiple constraints, synthesizing results from previous tool calls, planning intricate sequences of actions, troubleshooting complex errors, or making decisions involving multiple trade-offs. Avoid using it for straightforward tasks, basic information retrieval, summaries, always clearly define the reasoning challenge, structure thoughts explicitly, consider multiple perspectives, and summarize key insights before important decisions or complex tool interactions."

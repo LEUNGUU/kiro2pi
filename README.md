@@ -25,7 +25,7 @@ kiro2pi translates Anthropic and OpenAI API requests to CodeWhisperer Q API form
 - Automatic token management (reads from kiro-cli)
 - Streaming support (both Anthropic SSE and OpenAI SSE formats)
 - Tool use / function calling support
-- Extended thinking support (enabled and adaptive, via thinking tool)
+- Extended thinking support (thinking tool and native adaptive reasoning)
 - Automatic token refresh on 403 errors
 - Retry with exponential backoff for rate limits
 - Image/multimodal support (base64 PNG, JPEG, WebP, GIF)
@@ -275,6 +275,7 @@ No full request/response bodies are stored. Use `DEBUG_SAVE_RAW=1` for raw respo
 - Q API has a ~590KB request payload hard limit, which caps effective context at ~128K tokens (set `contextWindow: 128000` in models.json)
 - Input token counts are estimated (chars/4 heuristic)
 - URL-based image sources are not supported (only base64)
+- `output_config.effort` is accepted but cannot be forwarded because the Q API exposes no reasoning-effort parameter
 
 ## Credits
 
