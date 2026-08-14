@@ -572,7 +572,7 @@ type AnthropicRequest struct {
 	Temperature  *float64                  `json:"temperature,omitempty"`
 	Metadata     map[string]any            `json:"metadata,omitempty"`
 	Thinking     *AnthropicThinking        `json:"thinking,omitempty"`      // Extended thinking support
-	OutputConfig *AnthropicOutputConfig    `json:"output_config,omitempty"` // Accepted for compatibility; Q API cannot forward effort
+	OutputConfig *AnthropicOutputConfig    `json:"output_config,omitempty"` // Forwarded via additionalModelRequestFields for models that support it
 }
 
 // AnthropicStreamResponse 表示 Anthropic 流式响应的结构
@@ -852,11 +852,12 @@ type CodeWhispererRequest struct {
 		AgentTaskType       string `json:"agentTaskType,omitempty"`
 		CurrentMessage      struct {
 			UserInputMessage struct {
-				Content                 string      `json:"content"`
-				ModelId                 string      `json:"modelId"`
-				Origin                  string      `json:"origin"`
-				Images                  []KiroImage `json:"images,omitempty"`
-				UserInputMessageContext struct {
+				Content                      string         `json:"content"`
+				ModelId                      string         `json:"modelId"`
+				Origin                       string         `json:"origin"`
+				Images                       []KiroImage    `json:"images,omitempty"`
+				AdditionalModelRequestFields map[string]any `json:"additionalModelRequestFields,omitempty"`
+				UserInputMessageContext      struct {
 					ToolResults []map[string]any    `json:"toolResults,omitempty"`
 					Tools       []CodeWhispererTool `json:"tools,omitempty"`
 					EnvState    *EnvState           `json:"envState,omitempty"`
@@ -898,38 +899,98 @@ type CodeWhispererEvent struct {
 	EventType   string `json:"event-type"`
 }
 
+// Models that accept additionalModelRequestFields with thinking/output_config
+// (adaptive-thinking Claude models, per additionalModelRequestFieldsSchema
+// from the ListAvailableModels management API).
+var adaptiveThinkingModels = map[string]bool{
+	"claude-opus-5":     true,
+	"claude-sonnet-5":   true,
+	"claude-opus-4.8":   true,
+	"claude-opus-4.7":   true,
+	"claude-opus-4.6":   true,
+	"claude-sonnet-4.6": true,
+	"claude-fable-5":    true,
+}
+
+// Models that accept additionalModelRequestFields with reasoning.effort (GPT models).
+var reasoningEffortModels = map[string]bool{
+	"gpt-5.6-sol":   true,
+	"gpt-5.6-terra": true,
+	"gpt-5.6-luna":  true,
+}
+
+// buildAdditionalModelRequestFields maps Anthropic thinking/output_config to the
+// Q API additionalModelRequestFields payload for models whose schema supports it.
+// Returns nil when the model has no schema or nothing needs forwarding.
+func buildAdditionalModelRequestFields(modelId string, req AnthropicRequest) map[string]any {
+	effort := ""
+	if req.OutputConfig != nil {
+		effort = req.OutputConfig.Effort
+	}
+	switch {
+	case adaptiveThinkingModels[modelId]:
+		fields := map[string]any{}
+		if req.Thinking != nil {
+			switch req.Thinking.Type {
+			case "enabled", "adaptive":
+				thinking := map[string]any{"type": "adaptive"}
+				if d := req.Thinking.Display; d == "summarized" || d == "omitted" {
+					thinking["display"] = d
+				}
+				fields["thinking"] = thinking
+			case "disabled":
+				fields["thinking"] = map[string]any{"type": "disabled"}
+			}
+		}
+		// Schema enum: low|medium|high|xhigh|max. Invalid values silently degrade
+		// upstream, so filter here.
+		switch effort {
+		case "low", "medium", "high", "xhigh", "max":
+			fields["output_config"] = map[string]any{"effort": effort}
+		}
+		if len(fields) == 0 {
+			return nil
+		}
+		return fields
+	case reasoningEffortModels[modelId]:
+		if req.Thinking != nil && req.Thinking.Type == "disabled" {
+			effort = "none"
+		}
+		// Schema enum: none|low|medium|high|xhigh|max.
+		switch effort {
+		case "none", "low", "medium", "high", "xhigh", "max":
+			return map[string]any{"reasoning": map[string]any{"effort": effort}}
+		}
+		return nil
+	}
+	return nil
+}
+
 var ModelMap = map[string]string{
 	// Kiro supported models
-	"claude-sonnet-4.5": "claude-sonnet-4.5",
-	"claude-sonnet-4":   "claude-sonnet-4",
-	"claude-haiku-4.5":  "claude-haiku-4.5",
-	"claude-opus-4.5":   "claude-opus-4.5",
 	"claude-opus-4.6":   "claude-opus-4.6",
 	"claude-opus-4.7":   "claude-opus-4.7",
 	"claude-opus-4.8":   "claude-opus-4.8",
 	"claude-sonnet-4.6": "claude-sonnet-4.6",
 	"claude-sonnet-5":   "claude-sonnet-5",
 	"claude-opus-5":     "claude-opus-5",
-	"deepseek-3.2":      "deepseek-3.2",
 	"minimax-m2.5":      "minimax-m2.5",
 	"glm-5":             "glm-5",
 	"kimi-k2.5":         "kimi-k2.5",
-	"gpt-5.5":           "gpt-5.5",
 	"gpt-5.6-sol":       "gpt-5.6-sol",
+	"gpt-5.6-terra":     "gpt-5.6-terra",
+	"gpt-5.6-luna":      "gpt-5.6-luna",
 	"claude-fable-5":    "claude-fable-5",
 	// Anthropic SDK normalizes dots to hyphens in model names
-	"claude-sonnet-4-5": "claude-sonnet-4.5",
-	"claude-haiku-4-5":  "claude-haiku-4.5",
-	"claude-opus-4-5":   "claude-opus-4.5",
 	"claude-opus-4-6":   "claude-opus-4.6",
 	"claude-opus-4-7":   "claude-opus-4.7",
 	"claude-opus-4-8":   "claude-opus-4.8",
 	"claude-sonnet-4-6": "claude-sonnet-4.6",
-	"deepseek-3-2":      "deepseek-3.2",
 	"minimax-m2-5":      "minimax-m2.5",
 	"kimi-k2-5":         "kimi-k2.5",
-	"gpt-5-5":           "gpt-5.5",
 	"gpt-5-6-sol":       "gpt-5.6-sol",
+	"gpt-5-6-terra":     "gpt-5.6-terra",
+	"gpt-5-6-luna":      "gpt-5.6-luna",
 }
 
 // generateUUID generates a simple UUID v4
@@ -1278,9 +1339,20 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 		tools = append(tools, cwTool)
 	}
 
+	// Forward thinking config and effort natively for models that support
+	// additionalModelRequestFields (validated against the schema returned by
+	// ListAvailableModels on the management endpoint).
+	if amrf := buildAdditionalModelRequestFields(modelId, anthropicReq); amrf != nil {
+		cwReq.ConversationState.CurrentMessage.UserInputMessage.AdditionalModelRequestFields = amrf
+		if b, err := json.Marshal(amrf); err == nil {
+			log.Printf("Forwarding additionalModelRequestFields for %s: %s", modelId, b)
+		}
+	}
+
 	// Add thinking tool when thinking is enabled (matching kiro-cli behavior)
-	// The Q API implements thinking as a tool, not as a native parameter
-	if anthropicReq.Thinking != nil && (anthropicReq.Thinking.Type == "enabled" || anthropicReq.Thinking.Type == "adaptive") {
+	// for models WITHOUT native additionalModelRequestFields support.
+	if !adaptiveThinkingModels[modelId] && !reasoningEffortModels[modelId] &&
+		anthropicReq.Thinking != nil && (anthropicReq.Thinking.Type == "enabled" || anthropicReq.Thinking.Type == "adaptive") {
 		effort := ""
 		if anthropicReq.OutputConfig != nil {
 			effort = anthropicReq.OutputConfig.Effort

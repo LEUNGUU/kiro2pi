@@ -275,7 +275,7 @@ No full request/response bodies are stored. Use `DEBUG_SAVE_RAW=1` for raw respo
 - Q API has a ~590KB request payload hard limit, which caps effective context at ~128K tokens (set `contextWindow: 128000` in models.json)
 - Input token counts are estimated (chars/4 heuristic)
 - URL-based image sources are not supported (only base64)
-- `output_config.effort` is accepted but cannot be forwarded because the Q API exposes no reasoning-effort parameter
+- `output_config.effort` and `thinking` are forwarded natively via `additionalModelRequestFields` for models whose `ListAvailableModels` schema supports it (adaptive Claude models: opus-5, sonnet-5, fable-5, opus-4.6/4.7/4.8, sonnet-4.6; GPT models map effort to `reasoning.effort`). Older models fall back to the synthetic thinking tool and ignore effort.
 
 ## Credits
 
