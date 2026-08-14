@@ -1056,6 +1056,37 @@ func estimateInputTokens(req AnthropicRequest) int {
 	return (chars + 3) / 4
 }
 
+// modelContextWindow holds maxInputTokens per ListAvailableModels; used to
+// convert the upstream contextUsagePercentage into an absolute token count.
+var modelContextWindow = map[string]int{
+	"claude-opus-5":     1000000,
+	"claude-sonnet-5":   1000000,
+	"claude-opus-4.8":   1000000,
+	"claude-opus-4.7":   1000000,
+	"claude-opus-4.6":   1000000,
+	"claude-sonnet-4.6": 1000000,
+	"claude-fable-5":    1000000,
+	"gpt-5.6-sol":       272000,
+	"gpt-5.6-terra":     272000,
+	"gpt-5.6-luna":      272000,
+	"minimax-m2.5":      196000,
+	"glm-5":             200000,
+	"auto":              1000000,
+}
+
+// resolveInputTokens returns the real input token count derived from the
+// upstream contextUsagePercentage when available, falling back to the chars/4
+// estimate. The percentage is measured against the model's full window
+// (modelContextWindow), not the payload-limited effective context.
+func resolveInputTokens(anthropicReq AnthropicRequest, modelId string, contextUsagePct float64) int {
+	if contextUsagePct > 0 {
+		if window := modelContextWindow[modelId]; window > 0 {
+			return int(contextUsagePct / 100 * float64(window))
+		}
+	}
+	return estimateInputTokens(anthropicReq)
+}
+
 func countMessageChars(content any) int {
 	switch v := content.(type) {
 	case string:
@@ -3320,6 +3351,36 @@ func startServer(port string) {
 	}
 }
 
+// maxUpstreamPayloadBytes is the measured Q API request size limit (~1.9MB for
+// Claude/GPT models, ~600KB for minimax/glm; 2026-08). Reject slightly below
+// the Claude/GPT threshold so clients get a clean request_too_large error they
+// can react to (e.g. by compacting), instead of an opaque upstream 400.
+const maxUpstreamPayloadBytes = 1850 * 1024
+
+const smallModelPayloadBytes = 590 * 1024
+
+// payloadLimitFor returns the request size limit for the given upstream model.
+func payloadLimitFor(modelId string) int {
+	switch modelId {
+	case "minimax-m2.5", "glm-5":
+		return smallModelPayloadBytes
+	}
+	return maxUpstreamPayloadBytes
+}
+
+// writeRequestTooLarge sends an Anthropic-style request_too_large error (413).
+func writeRequestTooLarge(w http.ResponseWriter, size, limit int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusRequestEntityTooLarge)
+	json.NewEncoder(w).Encode(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "request_too_large",
+			"message": fmt.Sprintf("request payload %d bytes exceeds upstream limit %d; reduce context (prompt is too long)", size, limit),
+		},
+	})
+}
+
 // sendQApiRequest sends a request to Q API and returns the response body
 // Returns (responseBody, error)
 func sendQApiRequest(cwReq CodeWhispererRequest, accessToken string) ([]byte, error) {
@@ -3382,6 +3443,12 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 	cwReqBody, err := json.Marshal(cwReq)
 	if err != nil {
 		sendErrorEvent(w, flusher, "序列化请求失败", err)
+		return
+	}
+
+	if limit := payloadLimitFor(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId); len(cwReqBody) > limit {
+		log.Printf("请求体超限: %d bytes > %d", len(cwReqBody), limit)
+		writeRequestTooLarge(w, len(cwReqBody), limit)
 		return
 	}
 
@@ -3517,6 +3584,20 @@ processResponse:
 	parseResult := parser.ParseEventsWithThinking(respBody)
 
 	if parseResult.Refusal != "" && len(parseResult.Events) == 0 {
+		// The filter is probabilistic (same request may pass on retry), so try
+		// once more before surfacing the refusal.
+		log.Printf("CONTENT_FILTERED，重试一次...")
+		if retryBody, retryErr := sendQApiRequest(cwReq, accessToken); retryErr == nil {
+			retryResult := parser.ParseEventsWithThinking(retryBody)
+			if retryResult.Refusal == "" && len(retryResult.Events) > 0 {
+				log.Printf("CONTENT_FILTERED 重试成功")
+				respBody = retryBody
+				parseResult = retryResult
+			}
+		}
+	}
+
+	if parseResult.Refusal != "" && len(parseResult.Events) == 0 {
 		// Upstream content filter swallowed the whole response; surface the
 		// refusal instead of an empty/broken stream.
 		sendErrorEvent(w, flusher, "Upstream refused the request", fmt.Errorf("%s", parseResult.Refusal))
@@ -3557,9 +3638,10 @@ processResponse:
 	outputTokens := 0
 	hasRegularToolUse := false
 	continuationCount := 0
-	maxContinuations := 10             // Safety limit to prevent infinite loops
-	textIndex := parseResult.TextIndex // Track text index (0 if no thinking, 1 if thinking present)
-	textBlockStarted := false          // Track whether a text content_block_start was emitted
+	maxContinuations := 10                         // Safety limit to prevent infinite loops
+	textIndex := parseResult.TextIndex             // Track text index (0 if no thinking, 1 if thinking present)
+	textBlockStarted := false                      // Track whether a text content_block_start was emitted
+	contextUsagePct := parseResult.ContextUsagePct // Keep the last upstream usage across continuations
 
 	for continuationCount < maxContinuations {
 		continuationCount++
@@ -3624,6 +3706,9 @@ processResponse:
 
 			// Parse continuation response
 			parseResult = parser.ParseEventsWithThinking(contRespBody)
+			if parseResult.ContextUsagePct > 0 {
+				contextUsagePct = parseResult.ContextUsagePct
+			}
 			log.Printf("Continuation %d: events=%d, thinking=%s, hasRegularTools=%v",
 				continuationCount, len(parseResult.Events), parseResult.ThinkingToolId, parseResult.HasRegularTools)
 
@@ -3670,13 +3755,16 @@ processResponse:
 	if hasRegularToolUse {
 		stopReason = "tool_use"
 	}
+	// Prefer the upstream-reported context usage over the chars/4 estimate.
+	upstreamModelId := cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId
+	inputTokens := resolveInputTokens(anthropicReq, upstreamModelId, contextUsagePct)
 	messageDelta := map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
 		},
-		"usage": map[string]any{"input_tokens": estimateInputTokens(anthropicReq), "output_tokens": outputTokens},
+		"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens},
 	}
 	sendSSEEvent(w, flusher, "message_delta", messageDelta)
 
@@ -3693,6 +3781,12 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	if err != nil {
 		fmt.Printf("错误: 序列化请求失败: %v\n", err)
 		http.Error(w, fmt.Sprintf("序列化请求失败: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if limit := payloadLimitFor(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId); len(cwReqBody) > limit {
+		log.Printf("请求体超限 (非流式): %d bytes > %d", len(cwReqBody), limit)
+		writeRequestTooLarge(w, len(cwReqBody), limit)
 		return
 	}
 
@@ -3829,19 +3923,33 @@ processNonStreamResponse:
 	events := parser.ParseEvents(cwRespBody)
 
 	if refusal := parser.DetectRefusal(cwRespBody); refusal != "" && len(events) == 0 {
-		// Content filter swallowed the whole response; surface the refusal
-		// instead of returning an empty message.
-		log.Printf("Upstream CONTENT_FILTERED (non-stream): %s", refusal)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]any{
-			"type": "error",
-			"error": map[string]any{
-				"type":    "invalid_request_error",
-				"message": refusal,
-			},
-		})
-		return
+		// The filter is probabilistic; retry once before surfacing the refusal.
+		log.Printf("CONTENT_FILTERED (非流式)，重试一次...")
+		if retryBody, retryErr := sendQApiRequest(cwReq, accessToken); retryErr == nil {
+			retryEvents := parser.ParseEvents(retryBody)
+			if parser.DetectRefusal(retryBody) == "" && len(retryEvents) > 0 {
+				log.Printf("CONTENT_FILTERED 重试成功 (非流式)")
+				cwRespBody = retryBody
+				respBodyStr = string(cwRespBody)
+				events = retryEvents
+				refusal = ""
+			}
+		}
+		if refusal != "" {
+			// Content filter swallowed the whole response; surface the refusal
+			// instead of returning an empty message.
+			log.Printf("Upstream CONTENT_FILTERED (non-stream): %s", refusal)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{
+				"type": "error",
+				"error": map[string]any{
+					"type":    "invalid_request_error",
+					"message": refusal,
+				},
+			})
+			return
+		}
 	}
 
 	context := ""
@@ -3964,7 +4072,7 @@ processNonStreamResponse:
 		"stop_sequence": nil,
 		"type":          "message",
 		"usage": map[string]any{
-			"input_tokens":  estimateInputTokens(anthropicReq),
+			"input_tokens":  resolveInputTokens(anthropicReq, cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, parser.DetectContextUsage(cwRespBody)),
 			"output_tokens": len(context),
 		},
 	}

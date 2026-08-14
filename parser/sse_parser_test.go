@@ -460,3 +460,19 @@ func TestContentFilteredRefusal(t *testing.T) {
 		t.Errorf("false positive refusal: %q", got)
 	}
 }
+
+// TestContextUsageExtraction pins contextUsageEvent parsing, used to replace
+// the chars/4 input-token estimate with the upstream-reported value.
+func TestContextUsageExtraction(t *testing.T) {
+	resp := encodeTypedFrame("contextUsageEvent", `{"contextUsagePercentage":38.02280044555664}`)
+	if got := DetectContextUsage(resp); got < 38.0 || got > 38.1 {
+		t.Errorf("DetectContextUsage = %v, want ~38.02", got)
+	}
+	result := ParseEventsWithThinking(resp)
+	if result.ContextUsagePct < 38.0 || result.ContextUsagePct > 38.1 {
+		t.Errorf("ContextUsagePct = %v, want ~38.02", result.ContextUsagePct)
+	}
+	if got := DetectContextUsage(encodeTypedFrame("metadataEvent", `{}`)); got != 0 {
+		t.Errorf("false positive context usage: %v", got)
+	}
+}

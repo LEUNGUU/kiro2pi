@@ -139,12 +139,13 @@ type SSEEvent struct {
 // ParseResult contains parsed events and metadata about thinking tool usage
 type ParseResult struct {
 	Events          []SSEEvent
-	ThinkingToolId  string // Original tool ID if thinking was used, empty otherwise
-	ThinkingInput   string // Accumulated thinking content for continuation
-	HasRegularTools bool   // True if response contains non-thinking tool calls
-	TextIndex       int    // Index used for text content blocks (0 if no thinking, 1 if thinking present)
-	HasThinking     bool   // True if response contains thinking blocks
-	Refusal         string // Non-empty if upstream stopped with CONTENT_FILTERED; holds the refusal explanation
+	ThinkingToolId  string  // Original tool ID if thinking was used, empty otherwise
+	ThinkingInput   string  // Accumulated thinking content for continuation
+	HasRegularTools bool    // True if response contains non-thinking tool calls
+	TextIndex       int     // Index used for text content blocks (0 if no thinking, 1 if thinking present)
+	HasThinking     bool    // True if response contains thinking blocks
+	Refusal         string  // Non-empty if upstream stopped with CONTENT_FILTERED; holds the refusal explanation
+	ContextUsagePct float64 // contextUsagePercentage from upstream (0 if absent); percentage of the model's real context window
 }
 
 // metadataStopDetails mirrors the metadataEvent payload carrying refusal info:
@@ -191,6 +192,23 @@ func DetectRefusal(resp []byte) string {
 		}
 	}
 	return ""
+}
+
+// DetectContextUsage scans a raw event-stream response for a contextUsageEvent
+// and returns contextUsagePercentage, or 0 if absent.
+func DetectContextUsage(resp []byte) float64 {
+	for _, frame := range decodeFrames(resp) {
+		if frame.EventType != "contextUsageEvent" {
+			continue
+		}
+		var cu struct {
+			ContextUsagePercentage float64 `json:"contextUsagePercentage"`
+		}
+		if err := json.Unmarshal(frame.Payload, &cu); err == nil && cu.ContextUsagePercentage > 0 {
+			return cu.ContextUsagePercentage
+		}
+	}
+	return 0
 }
 
 func ParseEvents(resp []byte) []SSEEvent {
@@ -915,7 +933,20 @@ func ParseEventsWithThinking(resp []byte) ParseResult {
 				log.Printf("Upstream CONTENT_FILTERED: %s", r)
 			}
 			continue
-		case "initial-response", "contextUsageEvent", "meteringEvent":
+		case "contextUsageEvent":
+			var cu struct {
+				ContextUsagePercentage float64 `json:"contextUsagePercentage"`
+			}
+			if err := json.Unmarshal(frame.Payload, &cu); err == nil && cu.ContextUsagePercentage > 0 {
+				result.ContextUsagePct = cu.ContextUsagePercentage
+			}
+			continue
+		case "meteringEvent":
+			// Not consumed yet; log the structure to learn what upstream reports
+			// (credits, cache hits?) before wiring it up.
+			log.Printf("meteringEvent payload: %s", frame.Payload)
+			continue
+		case "initial-response":
 			if debugEnabled() {
 				log.Printf("DEBUG ParseEventsWithThinking: ignoring %s payload=%s", frame.EventType, frame.Payload)
 			}
