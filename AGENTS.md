@@ -8,7 +8,17 @@ kiro2pi is a proxy server that translates Anthropic API requests to AWS CodeWhis
 
 ## Architecture
 
-- **main.go**: Single-file Go application containing all proxy logic
+- **Package `main`** (split across files):
+  - `main.go`: Entry point, CLI dispatch, small shared helpers
+  - `server.go`: HTTP server setup, endpoint registration, middleware, retry policy, shared upstream client
+  - `handlers.go`: `/v1/messages` stream/non-stream handlers, OpenAI-compat handlers, SSE helpers, CONTENT_FILTERED retry/fallback
+  - `request.go`: Anthropic → CodeWhisperer request building (history, tools, images, validation pipeline)
+  - `models.go`: Model mapping, additionalModelRequestFields (thinking/effort/max_tokens), context windows, payload limits, token estimation
+  - `types.go`: Request/response structs (Anthropic + CodeWhisperer)
+  - `token.go`: kiro-cli SQLite token retrieval and refresh
+  - `bedrock.go`: Bedrock embeddings/rerank endpoints
+  - `observability.go`: Call logging to SQLite (`/stats`, `/logs`)
+- **`parser/`**: Event-stream (SSE) response parsing
 - **Endpoints**:
   - `POST /v1/messages` - Anthropic API proxy (main endpoint)
   - `POST /v1/embeddings` - Bedrock embeddings, OpenAI-compatible (only when Bedrock enabled)
@@ -77,12 +87,12 @@ journalctl -u kiro2pi --since "1 hour ago" | grep "请求路径:" | awk '{print 
 
 ## Key Code Locations
 
-- `logMiddleware` (~line 1496): HTTP request logging middleware
-- `startServer` (~line 1520): Server setup and endpoint registration
-- `handleStreamRequest` (~line 1656): Streaming response handler
-- `handleNonStreamRequest` (~line 1938): Non-streaming response handler
-- `getToken` (~line 1440): Token retrieval from kiro-cli database
+- `logMiddleware`, `startServer`: server.go
+- `handleStreamRequest`, `handleNonStreamRequest`: handlers.go
+- `buildCodeWhispererRequest`: request.go
+- `getToken`, `tryRefreshToken`: token.go
+- `ModelMap`, `buildAdditionalModelRequestFields`: models.go
 
 ## Model Mapping
 
-The server maps Anthropic model names to CodeWhisperer models (see `modelMapping` around line 629).
+The server maps Anthropic model names to CodeWhisperer models (see `ModelMap` in models.go).

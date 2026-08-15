@@ -29,7 +29,7 @@ kiro2pi translates Anthropic and OpenAI API requests to CodeWhisperer Q API form
 - Automatic token refresh on 403 errors
 - Retry with exponential backoff for rate limits
 - Image/multimodal support (base64 PNG, JPEG, WebP, GIF)
-- Hyphenated model name aliases (e.g. `claude-opus-4-7` → `claude-opus-4.7`)
+- Hyphenated model name aliases (e.g. `claude-opus-4-8` → `claude-opus-4.8`)
 
 ## Prerequisites
 
@@ -47,12 +47,29 @@ kiro2pi translates Anthropic and OpenAI API requests to CodeWhisperer Q API form
 ### From source
 
 ```bash
-go build -o kiro2pi main.go
+go build -o kiro2pi .
 ```
 
 ### From releases
 
 Download the latest release for your platform from the [Releases](https://github.com/LEUNGUU/kiro2pi/releases) page.
+
+## Project Layout
+
+Single `main` package split by concern:
+
+| File | Responsibility |
+|------|----------------|
+| `main.go` | Entry point, CLI dispatch |
+| `server.go` | HTTP server, routing, middleware, retry policy |
+| `handlers.go` | `/v1/messages` stream/non-stream handlers, OpenAI-compat handlers, SSE, content-filter fallback |
+| `request.go` | Anthropic → CodeWhisperer request building and history validation |
+| `models.go` | Model mapping, thinking/effort/max_tokens forwarding, context windows, payload limits |
+| `types.go` | Request/response structs |
+| `token.go` | kiro-cli token retrieval and refresh |
+| `bedrock.go` | Bedrock embeddings/rerank endpoints |
+| `observability.go` | Call logging to SQLite (`/stats`, `/logs`) |
+| `parser/` | Upstream event-stream (SSE) response parsing |
 
 ## Usage
 
@@ -79,21 +96,21 @@ Add to `~/.pi/agent/models.json`:
       "api": "anthropic-messages",
       "models": [
         {
-          "id": "claude-opus-4.7",
-          "name": "Claude Opus 4.7 (Kiro)",
+          "id": "claude-opus-5",
+          "name": "Claude Opus 5 (Kiro)",
           "reasoning": true,
           "input": ["text", "image"],
-          "cost": { "input": 33, "output": 33, "cacheRead": 0, "cacheWrite": 0 },
-          "contextWindow": 128000,
+          "cost": { "input": 5, "output": 25, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 400000,
           "maxTokens": 128000
         },
         {
-          "id": "claude-sonnet-4.5",
-          "name": "Claude Sonnet 4.5 (Kiro)",
+          "id": "claude-sonnet-5",
+          "name": "Claude Sonnet 5 (Kiro)",
           "reasoning": true,
           "input": ["text", "image"],
-          "cost": { "input": 19.5, "output": 19.5, "cacheRead": 0, "cacheWrite": 0 },
-          "contextWindow": 128000,
+          "cost": { "input": 3, "output": 15, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 400000,
           "maxTokens": 64000
         }
       ]
@@ -107,7 +124,7 @@ Set as default in `~/.pi/agent/settings.json`:
 ```json
 {
   "defaultProvider": "kiro",
-  "defaultModel": "claude-opus-4.5"
+  "defaultModel": "claude-opus-5"
 }
 ```
 
@@ -187,18 +204,20 @@ The proxy maps model names to CodeWhisperer models:
 
 | Request Model | CodeWhisperer Model |
 |---------------|---------------------|
+| `claude-opus-5` | `claude-opus-5` |
+| `claude-sonnet-5` | `claude-sonnet-5` |
+| `claude-fable-5` | `claude-fable-5` (experimental preview) |
+| `claude-opus-4.8` | `claude-opus-4.8` |
 | `claude-opus-4.7` | `claude-opus-4.7` |
 | `claude-opus-4.6` | `claude-opus-4.6` |
-| `claude-opus-4.5` | `claude-opus-4.5` |
 | `claude-sonnet-4.6` | `claude-sonnet-4.6` |
-| `claude-sonnet-4.5` | `claude-sonnet-4.5` |
-| `claude-sonnet-4` | `claude-sonnet-4` |
-| `claude-haiku-4.5` | `claude-haiku-4.5` |
-| `deepseek-3.2` | `deepseek-3.2` |
+| `gpt-5.6-sol` | `gpt-5.6-sol` |
+| `gpt-5.6-terra` | `gpt-5.6-terra` |
+| `gpt-5.6-luna` | `gpt-5.6-luna` |
 | `minimax-m2.5` | `minimax-m2.5` |
 | `glm-5` | `glm-5` |
 
-Hyphenated aliases are also supported (e.g. `claude-opus-4-7` → `claude-opus-4.7`).
+Hyphenated aliases are also supported (e.g. `claude-opus-4-8` → `claude-opus-4.8`), since the Anthropic SDK normalizes dots to hyphens.
 
 ## Bedrock Endpoints (optional)
 
@@ -276,7 +295,7 @@ No full request/response bodies are stored. Use `DEBUG_SAVE_RAW=1` for raw respo
 - `input_tokens` in responses is derived from the upstream `contextUsageEvent` (percentage of the model's real window) when present, falling back to a chars/4 estimate; per-request credit usage from `meteringEvent` is logged
 - claude-fable-5 (experimental preview) runs an aggressive content filter: large inputs (~280K+ tokens, lower for code-heavy content) may return 200 with `stopReason: CONTENT_FILTERED` and no output. The filter is probabilistic, so the proxy retries once on the same model, then falls back to `claude-opus-4.8` (mirroring Anthropic's official automatic-fallback behavior; Opus 4.8's classifiers intervene ~85% less often), and only surfaces an error if all attempts are filtered. Other Claude/GPT models are not affected
 - `max_tokens` is forwarded via `additionalModelRequestFields` for adaptive Claude models, but upstream currently accepts without enforcing it (output is not truncated)
-- A `cachePoint` checkpoint is set on the current message for prompt-caching-capable models; the API accepts it but exposes no cache usage metrics, so the benefit cannot be confirmed client-side
+- A `cachePoint` checkpoint is set on the tools array, the last history user message, and the current message for prompt-caching-capable models (schema allows 4 per request); the API accepts them but exposes no cache usage metrics, so the benefit cannot be confirmed client-side
 - Input token counts fall back to a chars/4 estimate when the upstream reports no context usage
 - URL-based image sources are not supported (only base64)
 - `output_config.effort` and `thinking` are forwarded natively via `additionalModelRequestFields` for models whose `ListAvailableModels` schema supports it (adaptive Claude models: opus-5, sonnet-5, fable-5, opus-4.6/4.7/4.8, sonnet-4.6; GPT models map effort to `reasoning.effort`). Older models fall back to the synthetic thinking tool and ignore effort.
