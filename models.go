@@ -229,3 +229,27 @@ func payloadLimitFor(modelId string) int {
 	}
 	return maxUpstreamPayloadBytes
 }
+
+// trimLimitFor returns the history-trim threshold for the model. Measured
+// 2026-09 with history-heavy multi-turn requests, which upstream rejects at
+// much lower sizes than single-message payloads (the threshold appears
+// token/content-based, not byte-based): glm-5 fails ~562KB, deepseek-3.2
+// ~643KB, minimax-m2.5/m2.1 ~787KB, claude-haiku-4.5 (200K window) ~831KB,
+// claude-sonnet-5 (1M window) ~1101KB, gpt-5.6-luna passes ~2960KB. Values
+// below keep a margin under the tightest observed failure for each group.
+func trimLimitFor(modelId string) int {
+	switch modelId {
+	case "glm-5":
+		return 500 * 1024
+	case "deepseek-3.2":
+		return 580 * 1024
+	case "minimax-m2.5", "minimax-m2.1":
+		return 700 * 1024
+	case "claude-opus-4.5", "claude-sonnet-4.5", "claude-sonnet-4", "claude-haiku-4.5":
+		return 780 * 1024 // 200K-window Claude models
+	case "claude-opus-5", "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7",
+		"claude-sonnet-4.6", "claude-fable-5", "claude-fable-5.1", "auto":
+		return 980 * 1024 // 1M-window Claude models
+	}
+	return maxUpstreamPayloadBytes // GPT 5.6 family
+}
