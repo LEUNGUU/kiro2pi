@@ -9,8 +9,9 @@ import (
 // automatic-fallback behavior (flagged Opus 5 / Fable 5 requests route to
 // Opus 4.8, whose classifiers intervene ~85% less often).
 var contentFilterFallbackModel = map[string]string{
-	"claude-fable-5": "claude-opus-4.8",
-	"claude-opus-5":  "claude-opus-4.8",
+	"claude-fable-5":   "claude-opus-4.8",
+	"claude-fable-5.1": "claude-opus-4.8",
+	"claude-opus-5":    "claude-opus-4.8",
 }
 
 // promptCachingModels lists models with supportsPromptCaching per
@@ -20,13 +21,16 @@ var promptCachingModels = map[string]int{
 	"claude-sonnet-5":   1024,
 	"claude-opus-4.8":   1024,
 	"claude-opus-4.7":   4096,
-	"claude-opus-4.6":   4096,
+	"claude-opus-4.5":   4096,
 	"claude-sonnet-4.6": 1024,
+	"claude-sonnet-4.5": 1024,
+	"claude-sonnet-4":   1024,
+	"claude-haiku-4.5":  4096,
 	"claude-fable-5":    4096,
+	"claude-fable-5.1":  4096,
 	"gpt-5.6-sol":       1024,
 	"gpt-5.6-terra":     1024,
 	"gpt-5.6-luna":      1024,
-	"auto":              1024,
 }
 
 // Models that accept additionalModelRequestFields with thinking/output_config
@@ -38,9 +42,9 @@ var adaptiveThinkingModels = map[string]int{
 	"claude-sonnet-5":   128000,
 	"claude-opus-4.8":   128000,
 	"claude-opus-4.7":   128000,
-	"claude-opus-4.6":   64000,
 	"claude-sonnet-4.6": 64000,
 	"claude-fable-5":    128000,
+	"claude-fable-5.1":  128000,
 }
 
 // Models that accept additionalModelRequestFields with reasoning.effort (GPT models).
@@ -111,28 +115,40 @@ func buildAdditionalModelRequestFields(modelId string, req AnthropicRequest) map
 }
 
 var ModelMap = map[string]string{
-	// Kiro supported models
-	"claude-opus-4.6":   "claude-opus-4.6",
+	// Kiro supported models (per ListAvailableModels, 2026-09; excludes
+	// auto, qwen3-coder-next, agi-nova-beta-1m by choice)
+	"claude-opus-4.5":   "claude-opus-4.5",
 	"claude-opus-4.7":   "claude-opus-4.7",
 	"claude-opus-4.8":   "claude-opus-4.8",
+	"claude-opus-5":     "claude-opus-5",
+	"claude-sonnet-4":   "claude-sonnet-4",
+	"claude-sonnet-4.5": "claude-sonnet-4.5",
 	"claude-sonnet-4.6": "claude-sonnet-4.6",
 	"claude-sonnet-5":   "claude-sonnet-5",
-	"claude-opus-5":     "claude-opus-5",
-	"minimax-m2.5":      "minimax-m2.5",
-	"glm-5":             "glm-5",
+	"claude-haiku-4.5":  "claude-haiku-4.5",
+	"claude-fable-5":    "claude-fable-5",
+	"claude-fable-5.1":  "claude-fable-5.1",
 	"gpt-5.6-sol":       "gpt-5.6-sol",
 	"gpt-5.6-terra":     "gpt-5.6-terra",
 	"gpt-5.6-luna":      "gpt-5.6-luna",
-	"claude-fable-5":    "claude-fable-5",
+	"deepseek-3.2":      "deepseek-3.2",
+	"minimax-m2.1":      "minimax-m2.1",
+	"minimax-m2.5":      "minimax-m2.5",
+	"glm-5":             "glm-5",
 	// Anthropic SDK normalizes dots to hyphens in model names
-	"claude-opus-4-6":   "claude-opus-4.6",
+	"claude-opus-4-5":   "claude-opus-4.5",
 	"claude-opus-4-7":   "claude-opus-4.7",
 	"claude-opus-4-8":   "claude-opus-4.8",
+	"claude-sonnet-4-5": "claude-sonnet-4.5",
 	"claude-sonnet-4-6": "claude-sonnet-4.6",
-	"minimax-m2-5":      "minimax-m2.5",
+	"claude-haiku-4-5":  "claude-haiku-4.5",
+	"claude-fable-5-1":  "claude-fable-5.1",
 	"gpt-5-6-sol":       "gpt-5.6-sol",
 	"gpt-5-6-terra":     "gpt-5.6-terra",
 	"gpt-5-6-luna":      "gpt-5.6-luna",
+	"deepseek-3-2":      "deepseek-3.2",
+	"minimax-m2-1":      "minimax-m2.1",
+	"minimax-m2-5":      "minimax-m2.5",
 }
 
 // buildCodeWhispererRequest 构建 CodeWhisperer 请求 (Q API format matching kiro-cli)
@@ -161,15 +177,20 @@ var modelContextWindow = map[string]int{
 	"claude-sonnet-5":   1000000,
 	"claude-opus-4.8":   1000000,
 	"claude-opus-4.7":   1000000,
-	"claude-opus-4.6":   1000000,
+	"claude-opus-4.5":   200000,
 	"claude-sonnet-4.6": 1000000,
+	"claude-sonnet-4.5": 200000,
+	"claude-sonnet-4":   200000,
+	"claude-haiku-4.5":  200000,
 	"claude-fable-5":    1000000,
-	"gpt-5.6-sol":       272000,
-	"gpt-5.6-terra":     272000,
-	"gpt-5.6-luna":      272000,
+	"claude-fable-5.1":  1000000,
+	"gpt-5.6-sol":       1000000,
+	"gpt-5.6-terra":     1000000,
+	"gpt-5.6-luna":      1000000,
+	"deepseek-3.2":      164000,
+	"minimax-m2.1":      196000,
 	"minimax-m2.5":      196000,
 	"glm-5":             200000,
-	"auto":              1000000,
 }
 
 // resolveInputTokens returns the real input token count derived from the
@@ -185,18 +206,25 @@ func resolveInputTokens(anthropicReq AnthropicRequest, modelId string, contextUs
 	return estimateInputTokens(anthropicReq)
 }
 
-// maxUpstreamPayloadBytes is the measured Q API request size limit (~1.9MB for
-// Claude/GPT models, ~600KB for minimax/glm; 2026-08). Reject slightly below
-// the Claude/GPT threshold so clients get a clean request_too_large error they
-// can react to (e.g. by compacting), instead of an opaque upstream 400.
+// maxUpstreamPayloadBytes is the request size limit for Claude/GPT models.
+// Measured 2026-09: gpt-5.6-luna accepts ~4.9MB, but Claude models were not
+// probed individually, so this stays at the previously verified ~1.9MB
+// threshold. Reject slightly below it so clients get a clean
+// request_too_large error they can react to (e.g. by compacting), instead of
+// an opaque upstream 400.
 const maxUpstreamPayloadBytes = 1850 * 1024
 
-const smallModelPayloadBytes = 590 * 1024
+// smallModelPayloadBytes is the limit for minimax/glm/deepseek. Measured
+// 2026-09 (repeated-char filler, upstream CONTENT_LENGTH_EXCEEDS_THRESHOLD):
+// glm-5 rejects at ~1051KB (tightest), deepseek-3.2 ~1182KB, minimax-m2.1
+// ~1412KB, minimax-m2.5 ~1444KB. The threshold may be token-based rather than
+// byte-based, so keep a margin below the tightest observed rejection.
+const smallModelPayloadBytes = 950 * 1024
 
 // payloadLimitFor returns the request size limit for the given upstream model.
 func payloadLimitFor(modelId string) int {
 	switch modelId {
-	case "minimax-m2.5", "glm-5":
+	case "minimax-m2.5", "minimax-m2.1", "glm-5", "deepseek-3.2":
 		return smallModelPayloadBytes
 	}
 	return maxUpstreamPayloadBytes
