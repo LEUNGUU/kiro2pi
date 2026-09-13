@@ -207,14 +207,20 @@ The proxy maps model names to CodeWhisperer models:
 | `claude-opus-5` | `claude-opus-5` |
 | `claude-sonnet-5` | `claude-sonnet-5` |
 | `claude-fable-5` | `claude-fable-5` (experimental preview) |
+| `claude-fable-5.1` | `claude-fable-5.1` (experimental preview) |
 | `claude-opus-4.8` | `claude-opus-4.8` |
 | `claude-opus-4.7` | `claude-opus-4.7` |
-| `claude-opus-4.6` | `claude-opus-4.6` |
+| `claude-opus-4.5` | `claude-opus-4.5` |
 | `claude-sonnet-4.6` | `claude-sonnet-4.6` |
+| `claude-sonnet-4.5` | `claude-sonnet-4.5` |
+| `claude-sonnet-4` | `claude-sonnet-4` |
+| `claude-haiku-4.5` | `claude-haiku-4.5` |
 | `gpt-5.6-sol` | `gpt-5.6-sol` |
 | `gpt-5.6-terra` | `gpt-5.6-terra` |
 | `gpt-5.6-luna` | `gpt-5.6-luna` |
+| `deepseek-3.2` | `deepseek-3.2` |
 | `minimax-m2.5` | `minimax-m2.5` |
+| `minimax-m2.1` | `minimax-m2.1` |
 | `glm-5` | `glm-5` |
 
 Hyphenated aliases are also supported (e.g. `claude-opus-4-8` → `claude-opus-4.8`), since the Anthropic SDK normalizes dots to hyphens.
@@ -298,7 +304,7 @@ No full request/response bodies are stored. Use `DEBUG_SAVE_RAW=1` for raw respo
 - A `cachePoint` checkpoint is set on the tools array, the last history user message, and the current message for prompt-caching-capable models (schema allows 4 per request); the API accepts them but exposes no cache usage metrics, so the benefit cannot be confirmed client-side
 - Input token counts fall back to a chars/4 estimate when the upstream reports no context usage
 - URL-based image sources are not supported (only base64)
-- `output_config.effort` and `thinking` are forwarded natively via `additionalModelRequestFields` for models whose `ListAvailableModels` schema supports it (adaptive Claude models: opus-5, sonnet-5, fable-5, opus-4.6/4.7/4.8, sonnet-4.6; GPT models map effort to `reasoning.effort`). Older models fall back to the synthetic thinking tool and ignore effort.
+- `output_config.effort` and `thinking` are forwarded natively via `additionalModelRequestFields` for models whose `ListAvailableModels` schema supports it (adaptive Claude models: opus-5, sonnet-5, fable-5/5.1, opus-4.7/4.8, sonnet-4.6; GPT models map effort to `reasoning.effort`). Older models fall back to the synthetic thinking tool and ignore effort.
 
 ## Credits
 
