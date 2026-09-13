@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"sort"
 )
 
 // contentFilterFallbackModel maps models whose safety classifiers filter
@@ -149,6 +150,22 @@ var ModelMap = map[string]string{
 	"deepseek-3-2":      "deepseek-3.2",
 	"minimax-m2-1":      "minimax-m2.1",
 	"minimax-m2-5":      "minimax-m2.5",
+}
+
+// listCanonicalModels returns the deduplicated canonical model IDs (the
+// values of ModelMap, excluding hyphen-alias keys), sorted alphabetically.
+func listCanonicalModels() []string {
+	seen := make(map[string]bool, len(ModelMap))
+	models := make([]string, 0, len(ModelMap))
+	for _, canonical := range ModelMap {
+		if seen[canonical] {
+			continue
+		}
+		seen[canonical] = true
+		models = append(models, canonical)
+	}
+	sort.Strings(models)
+	return models
 }
 
 // buildCodeWhispererRequest 构建 CodeWhisperer 请求 (Q API format matching kiro-cli)
