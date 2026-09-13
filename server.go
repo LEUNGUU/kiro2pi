@@ -489,31 +489,21 @@ func startServer(port string) {
 			http.Error(w, "只支持GET请求", http.StatusMethodNotAllowed)
 			return
 		}
-		models := []map[string]string{
-			{"id": "claude-sonnet-4.5", "type": "model", "display_name": "Claude Sonnet 4.5", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "claude-sonnet-4", "type": "model", "display_name": "Claude Sonnet 4", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "claude-haiku-4.5", "type": "model", "display_name": "Claude Haiku 4.5", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "claude-opus-4.5", "type": "model", "display_name": "Claude Opus 4.5", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "claude-opus-4.7", "type": "model", "display_name": "Claude Opus 4.7", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "claude-opus-4.8", "type": "model", "display_name": "Claude Opus 4.8", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "claude-sonnet-4.6", "type": "model", "display_name": "Claude Sonnet 4.6", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "claude-sonnet-5", "type": "model", "display_name": "Claude Sonnet 5", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "claude-opus-5", "type": "model", "display_name": "Claude Opus 5", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "claude-fable-5", "type": "model", "display_name": "Claude Fable 5", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "claude-fable-5.1", "type": "model", "display_name": "Claude Fable 5.1", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "deepseek-3.2", "type": "model", "display_name": "DeepSeek 3.2", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "minimax-m2.1", "type": "model", "display_name": "MiniMax M2.1", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "minimax-m2.5", "type": "model", "display_name": "MiniMax M2.5", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "glm-5", "type": "model", "display_name": "GLM-5", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "gpt-5.6-sol", "type": "model", "display_name": "GPT-5.6 Sol", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "gpt-5.6-terra", "type": "model", "display_name": "GPT-5.6 Terra", "created_at": "2025-01-01T00:00:00Z"},
-			{"id": "gpt-5.6-luna", "type": "model", "display_name": "GPT-5.6 Luna", "created_at": "2025-01-01T00:00:00Z"},
+		canonical := listCanonicalModels()
+		models := make([]map[string]string, 0, len(canonical))
+		for _, id := range canonical {
+			models = append(models, map[string]string{"id": id, "type": "model", "display_name": id, "created_at": "2025-01-01T00:00:00Z"})
+		}
+		var firstID, lastID string
+		if len(canonical) > 0 {
+			firstID = canonical[0]
+			lastID = canonical[len(canonical)-1]
 		}
 		resp := map[string]any{
 			"data":     models,
 			"has_more": false,
-			"first_id": "claude-sonnet-4.5",
-			"last_id":  "gpt-5.6-luna",
+			"first_id": firstID,
+			"last_id":  lastID,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
