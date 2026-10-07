@@ -10,14 +10,16 @@ import (
 // automatic-fallback behavior (flagged Opus 5 / Fable 5 requests route to
 // Opus 4.8, whose classifiers intervene ~85% less often).
 var contentFilterFallbackModel = map[string]string{
-	"claude-fable-5":   "claude-opus-4.8",
 	"claude-fable-5.1": "claude-opus-4.8",
 	"claude-opus-5":    "claude-opus-4.8",
+	"claude-opus-5.5":  "claude-opus-4.8",
 }
 
 // promptCachingModels lists models with supportsPromptCaching per
 // ListAvailableModels, mapped to minimumTokensPerCacheCheckpoint.
 var promptCachingModels = map[string]int{
+	"claude-opus-5.5":   1024,
+	"claude-sonnet-5.5": 1024,
 	"claude-opus-5":     1024,
 	"claude-sonnet-5":   1024,
 	"claude-opus-4.8":   1024,
@@ -27,7 +29,6 @@ var promptCachingModels = map[string]int{
 	"claude-sonnet-4.5": 1024,
 	"claude-sonnet-4":   1024,
 	"claude-haiku-4.5":  4096,
-	"claude-fable-5":    4096,
 	"claude-fable-5.1":  4096,
 	"gpt-5.6-sol":       1024,
 	"gpt-5.6-terra":     1024,
@@ -39,12 +40,13 @@ var promptCachingModels = map[string]int{
 // from the ListAvailableModels management API). Value is the schema's
 // max_tokens maximum for the model.
 var adaptiveThinkingModels = map[string]int{
+	"claude-opus-5.5":   128000,
+	"claude-sonnet-5.5": 128000,
 	"claude-opus-5":     128000,
 	"claude-sonnet-5":   128000,
 	"claude-opus-4.8":   128000,
 	"claude-opus-4.7":   128000,
 	"claude-sonnet-4.6": 64000,
-	"claude-fable-5":    128000,
 	"claude-fable-5.1":  128000,
 }
 
@@ -118,6 +120,8 @@ func buildAdditionalModelRequestFields(modelId string, req AnthropicRequest) map
 var ModelMap = map[string]string{
 	// Kiro supported models (per ListAvailableModels, 2026-09; excludes
 	// auto, qwen3-coder-next, agi-nova-beta-1m by choice)
+	"claude-opus-5.5":   "claude-opus-5.5",
+	"claude-sonnet-5.5": "claude-sonnet-5.5",
 	"claude-opus-4.5":   "claude-opus-4.5",
 	"claude-opus-4.7":   "claude-opus-4.7",
 	"claude-opus-4.8":   "claude-opus-4.8",
@@ -127,7 +131,6 @@ var ModelMap = map[string]string{
 	"claude-sonnet-4.6": "claude-sonnet-4.6",
 	"claude-sonnet-5":   "claude-sonnet-5",
 	"claude-haiku-4.5":  "claude-haiku-4.5",
-	"claude-fable-5":    "claude-fable-5",
 	"claude-fable-5.1":  "claude-fable-5.1",
 	"gpt-5.6-sol":       "gpt-5.6-sol",
 	"gpt-5.6-terra":     "gpt-5.6-terra",
@@ -137,6 +140,8 @@ var ModelMap = map[string]string{
 	"minimax-m2.5":      "minimax-m2.5",
 	"glm-5":             "glm-5",
 	// Anthropic SDK normalizes dots to hyphens in model names
+	"claude-opus-5-5":   "claude-opus-5.5",
+	"claude-sonnet-5-5": "claude-sonnet-5.5",
 	"claude-opus-4-5":   "claude-opus-4.5",
 	"claude-opus-4-7":   "claude-opus-4.7",
 	"claude-opus-4-8":   "claude-opus-4.8",
@@ -190,6 +195,8 @@ func estimateInputTokens(req AnthropicRequest) int {
 // modelContextWindow holds maxInputTokens per ListAvailableModels; used to
 // convert the upstream contextUsagePercentage into an absolute token count.
 var modelContextWindow = map[string]int{
+	"claude-opus-5.5":   1000000,
+	"claude-sonnet-5.5": 1000000,
 	"claude-opus-5":     1000000,
 	"claude-sonnet-5":   1000000,
 	"claude-opus-4.8":   1000000,
@@ -199,7 +206,6 @@ var modelContextWindow = map[string]int{
 	"claude-sonnet-4.5": 200000,
 	"claude-sonnet-4":   200000,
 	"claude-haiku-4.5":  200000,
-	"claude-fable-5":    1000000,
 	"claude-fable-5.1":  1000000,
 	"gpt-5.6-sol":       1000000,
 	"gpt-5.6-terra":     1000000,
@@ -264,8 +270,8 @@ func trimLimitFor(modelId string) int {
 		return 700 * 1024
 	case "claude-opus-4.5", "claude-sonnet-4.5", "claude-sonnet-4", "claude-haiku-4.5":
 		return 780 * 1024 // 200K-window Claude models
-	case "claude-opus-5", "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7",
-		"claude-sonnet-4.6", "claude-fable-5", "claude-fable-5.1", "auto":
+	case "claude-opus-5", "claude-opus-5.5", "claude-sonnet-5", "claude-sonnet-5.5",
+		"claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-4.6", "claude-fable-5.1", "auto":
 		return 980 * 1024 // 1M-window Claude models
 	}
 	return maxUpstreamPayloadBytes // GPT 5.6 family

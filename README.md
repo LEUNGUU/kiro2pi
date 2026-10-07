@@ -204,9 +204,10 @@ The proxy maps model names to CodeWhisperer models:
 
 | Request Model | CodeWhisperer Model |
 |---------------|---------------------|
+| `claude-opus-5.5` | `claude-opus-5.5` |
+| `claude-sonnet-5.5` | `claude-sonnet-5.5` |
 | `claude-opus-5` | `claude-opus-5` |
 | `claude-sonnet-5` | `claude-sonnet-5` |
-| `claude-fable-5` | `claude-fable-5` (experimental preview) |
 | `claude-fable-5.1` | `claude-fable-5.1` (experimental preview) |
 | `claude-opus-4.8` | `claude-opus-4.8` |
 | `claude-opus-4.7` | `claude-opus-4.7` |
@@ -299,12 +300,12 @@ No full request/response bodies are stored. Use `DEBUG_SAVE_RAW=1` for raw respo
 
 - Q API request payload hard limit is ~1.9MB for Claude/GPT models and ~600KB for minimax/glm (measured 2026-08). The proxy pre-checks the serialized request and returns an Anthropic-style 413 `request_too_large` instead of an opaque upstream 400
 - `input_tokens` in responses is derived from the upstream `contextUsageEvent` (percentage of the model's real window) when present, falling back to a chars/4 estimate; per-request credit usage from `meteringEvent` is logged
-- claude-fable-5 (experimental preview) runs an aggressive content filter: large inputs (~280K+ tokens, lower for code-heavy content) may return 200 with `stopReason: CONTENT_FILTERED` and no output. The filter is probabilistic, so the proxy retries once on the same model, then falls back to `claude-opus-4.8` (mirroring Anthropic's official automatic-fallback behavior; Opus 4.8's classifiers intervene ~85% less often), and only surfaces an error if all attempts are filtered. Other Claude/GPT models are not affected
+- claude-fable-5.1 (experimental preview) runs an aggressive content filter: large inputs (~280K+ tokens, lower for code-heavy content) may return 200 with `stopReason: CONTENT_FILTERED` and no output. The filter is probabilistic, so the proxy retries once on the same model, then falls back to `claude-opus-4.8` (mirroring Anthropic's official automatic-fallback behavior; Opus 4.8's classifiers intervene ~85% less often), and only surfaces an error if all attempts are filtered. Other Claude/GPT models are not affected
 - `max_tokens` is forwarded via `additionalModelRequestFields` for adaptive Claude models, but upstream currently accepts without enforcing it (output is not truncated)
 - A `cachePoint` checkpoint is set on the tools array, the last history user message, and the current message for prompt-caching-capable models (schema allows 4 per request); the API accepts them but exposes no cache usage metrics, so the benefit cannot be confirmed client-side
 - Input token counts fall back to a chars/4 estimate when the upstream reports no context usage
 - URL-based image sources are not supported (only base64)
-- `output_config.effort` and `thinking` are forwarded natively via `additionalModelRequestFields` for models whose `ListAvailableModels` schema supports it (adaptive Claude models: opus-5, sonnet-5, fable-5/5.1, opus-4.7/4.8, sonnet-4.6; GPT models map effort to `reasoning.effort`). Older models fall back to the synthetic thinking tool and ignore effort.
+- `output_config.effort` and `thinking` are forwarded natively via `additionalModelRequestFields` for models whose `ListAvailableModels` schema supports it (adaptive Claude models: opus-5.5/5, sonnet-5.5/5, fable-5.1, opus-4.7/4.8, sonnet-4.6; GPT models map effort to `reasoning.effort`). Older models fall back to the synthetic thinking tool and ignore effort.
 
 ## Credits
 
