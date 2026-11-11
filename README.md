@@ -206,25 +206,29 @@ The proxy maps model names to CodeWhisperer models:
 |---------------|---------------------|
 | `claude-opus-5.5` | `claude-opus-5.5` |
 | `claude-sonnet-5.5` | `claude-sonnet-5.5` |
+| `claude-haiku-5.5` | `claude-haiku-5.5` |
 | `claude-opus-5` | `claude-opus-5` |
 | `claude-sonnet-5` | `claude-sonnet-5` |
-| `claude-fable-5.1` | `claude-fable-5.1` (experimental preview) |
+| `claude-fable-5.1` | `claude-fable-5.1` (internal development only; no customer, export-controlled, or personal data) |
 | `claude-opus-4.8` | `claude-opus-4.8` |
 | `claude-opus-4.7` | `claude-opus-4.7` |
 | `claude-opus-4.5` | `claude-opus-4.5` |
 | `claude-sonnet-4.6` | `claude-sonnet-4.6` |
 | `claude-sonnet-4.5` | `claude-sonnet-4.5` |
-| `claude-sonnet-4` | `claude-sonnet-4` |
 | `claude-haiku-4.5` | `claude-haiku-4.5` |
 | `gpt-5.6-sol` | `gpt-5.6-sol` |
 | `gpt-5.6-terra` | `gpt-5.6-terra` |
 | `gpt-5.6-luna` | `gpt-5.6-luna` |
+| `grok-4.7` | `grok-4.7` (experimental preview) |
+| `kimi-k3` | `kimi-k3` (Kiro Excluded Model; check Kiro usage terms) |
 | `deepseek-3.2` | `deepseek-3.2` |
 | `minimax-m2.5` | `minimax-m2.5` |
 | `minimax-m2.1` | `minimax-m2.1` |
 | `glm-5` | `glm-5` |
 
 Hyphenated aliases are also supported (e.g. `claude-opus-4-8` → `claude-opus-4.8`), since the Anthropic SDK normalizes dots to hyphens.
+
+This list matches `kiro-cli 3.2.0` as of 2026-11, except for intentionally excluded `auto`, `qwen3-coder-next`, and `agi-nova-beta-1m`. GPT 5.6 models have a 986,000-token input window; Haiku 5.5 and Kimi K3 have 1,000,000, and Grok 4.7 has 500,000. The list-models output does not expose caching or reasoning schemas, so new models use the existing fallback behavior until those capabilities are verified.
 
 ## Bedrock Endpoints (optional)
 

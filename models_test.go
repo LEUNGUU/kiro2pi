@@ -5,6 +5,61 @@ import (
 	"testing"
 )
 
+func TestModelCatalogFromKiroCLI(t *testing.T) {
+	// Snapshot of kiro-cli 3.2.0, 2026-11, minus the three intentional exclusions.
+	want := map[string]int{
+		"claude-opus-5.5":   1000000,
+		"claude-sonnet-5.5": 1000000,
+		"claude-haiku-5.5":  1000000,
+		"claude-opus-5":     1000000,
+		"claude-sonnet-5":   1000000,
+		"claude-opus-4.8":   1000000,
+		"claude-opus-4.7":   1000000,
+		"claude-sonnet-4.6": 1000000,
+		"claude-opus-4.5":   200000,
+		"claude-sonnet-4.5": 200000,
+		"claude-haiku-4.5":  200000,
+		"claude-fable-5.1":  1000000,
+		"gpt-5.6-sol":       986000,
+		"gpt-5.6-terra":     986000,
+		"gpt-5.6-luna":      986000,
+		"grok-4.7":          500000,
+		"kimi-k3":           1000000,
+		"deepseek-3.2":      164000,
+		"minimax-m2.5":      196000,
+		"minimax-m2.1":      196000,
+		"glm-5":             200000,
+	}
+	if got := len(listCanonicalModels()); got != len(want) {
+		t.Errorf("model count = %d, want %d", got, len(want))
+	}
+	if len(modelContextWindow) != len(want) {
+		t.Errorf("context window count = %d, want %d", len(modelContextWindow), len(want))
+	}
+	for id, window := range want {
+		if ModelMap[id] != id {
+			t.Errorf("ModelMap[%q] = %q, want %q", id, ModelMap[id], id)
+		}
+		if modelContextWindow[id] != window {
+			t.Errorf("modelContextWindow[%q] = %d, want %d", id, modelContextWindow[id], window)
+		}
+		if got := resolveInputTokens(AnthropicRequest{}, id, 10); got != window/10 {
+			t.Errorf("resolveInputTokens(%q, 10%%) = %d, want %d", id, got, window/10)
+		}
+	}
+	for alias, id := range map[string]string{
+		"claude-haiku-5-5": "claude-haiku-5.5",
+		"grok-4-7":         "grok-4.7",
+	} {
+		if ModelMap[alias] != id {
+			t.Errorf("ModelMap[%q] = %q, want %q", alias, ModelMap[alias], id)
+		}
+	}
+	if got := trimLimitFor("claude-haiku-5.5"); got != 980*1024 {
+		t.Errorf("Haiku 5.5 trim limit = %d, want %d", got, 980*1024)
+	}
+}
+
 func TestListCanonicalModels(t *testing.T) {
 	got := listCanonicalModels()
 
