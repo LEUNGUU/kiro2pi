@@ -73,6 +73,6 @@ go test ./parser -v
 ## Development Notes
 
 - Model mapping required between Anthropic and CodeWhisperer model IDs (see `ModelMap`)
-- Currently supported models: `claude-sonnet-4-20250514`, `claude-3-5-haiku-20241022`
+- See `models.go` for currently supported models and hyphenated aliases.
 - Streaming responses include random delays (0-300ms) between events
 - Automatic token refresh on 403 authentication failures

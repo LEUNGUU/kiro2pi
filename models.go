@@ -27,7 +27,6 @@ var promptCachingModels = map[string]int{
 	"claude-opus-4.5":   4096,
 	"claude-sonnet-4.6": 1024,
 	"claude-sonnet-4.5": 1024,
-	"claude-sonnet-4":   1024,
 	"claude-haiku-4.5":  4096,
 	"claude-fable-5.1":  4096,
 	"gpt-5.6-sol":       1024,
@@ -118,15 +117,15 @@ func buildAdditionalModelRequestFields(modelId string, req AnthropicRequest) map
 }
 
 var ModelMap = map[string]string{
-	// Kiro supported models (per ListAvailableModels, 2026-09; excludes
+	// Kiro supported models (per kiro-cli 3.2.0, 2026-11; excludes
 	// auto, qwen3-coder-next, agi-nova-beta-1m by choice)
 	"claude-opus-5.5":   "claude-opus-5.5",
 	"claude-sonnet-5.5": "claude-sonnet-5.5",
+	"claude-haiku-5.5":  "claude-haiku-5.5",
 	"claude-opus-4.5":   "claude-opus-4.5",
 	"claude-opus-4.7":   "claude-opus-4.7",
 	"claude-opus-4.8":   "claude-opus-4.8",
 	"claude-opus-5":     "claude-opus-5",
-	"claude-sonnet-4":   "claude-sonnet-4",
 	"claude-sonnet-4.5": "claude-sonnet-4.5",
 	"claude-sonnet-4.6": "claude-sonnet-4.6",
 	"claude-sonnet-5":   "claude-sonnet-5",
@@ -135,6 +134,8 @@ var ModelMap = map[string]string{
 	"gpt-5.6-sol":       "gpt-5.6-sol",
 	"gpt-5.6-terra":     "gpt-5.6-terra",
 	"gpt-5.6-luna":      "gpt-5.6-luna",
+	"grok-4.7":          "grok-4.7",
+	"kimi-k3":           "kimi-k3",
 	"deepseek-3.2":      "deepseek-3.2",
 	"minimax-m2.1":      "minimax-m2.1",
 	"minimax-m2.5":      "minimax-m2.5",
@@ -142,6 +143,7 @@ var ModelMap = map[string]string{
 	// Anthropic SDK normalizes dots to hyphens in model names
 	"claude-opus-5-5":   "claude-opus-5.5",
 	"claude-sonnet-5-5": "claude-sonnet-5.5",
+	"claude-haiku-5-5":  "claude-haiku-5.5",
 	"claude-opus-4-5":   "claude-opus-4.5",
 	"claude-opus-4-7":   "claude-opus-4.7",
 	"claude-opus-4-8":   "claude-opus-4.8",
@@ -152,6 +154,7 @@ var ModelMap = map[string]string{
 	"gpt-5-6-sol":       "gpt-5.6-sol",
 	"gpt-5-6-terra":     "gpt-5.6-terra",
 	"gpt-5-6-luna":      "gpt-5.6-luna",
+	"grok-4-7":          "grok-4.7",
 	"deepseek-3-2":      "deepseek-3.2",
 	"minimax-m2-1":      "minimax-m2.1",
 	"minimax-m2-5":      "minimax-m2.5",
@@ -197,6 +200,7 @@ func estimateInputTokens(req AnthropicRequest) int {
 var modelContextWindow = map[string]int{
 	"claude-opus-5.5":   1000000,
 	"claude-sonnet-5.5": 1000000,
+	"claude-haiku-5.5":  1000000,
 	"claude-opus-5":     1000000,
 	"claude-sonnet-5":   1000000,
 	"claude-opus-4.8":   1000000,
@@ -204,12 +208,13 @@ var modelContextWindow = map[string]int{
 	"claude-opus-4.5":   200000,
 	"claude-sonnet-4.6": 1000000,
 	"claude-sonnet-4.5": 200000,
-	"claude-sonnet-4":   200000,
 	"claude-haiku-4.5":  200000,
 	"claude-fable-5.1":  1000000,
-	"gpt-5.6-sol":       1000000,
-	"gpt-5.6-terra":     1000000,
-	"gpt-5.6-luna":      1000000,
+	"gpt-5.6-sol":       986000,
+	"gpt-5.6-terra":     986000,
+	"gpt-5.6-luna":      986000,
+	"grok-4.7":          500000,
+	"kimi-k3":           1000000,
 	"deepseek-3.2":      164000,
 	"minimax-m2.1":      196000,
 	"minimax-m2.5":      196000,
@@ -268,9 +273,9 @@ func trimLimitFor(modelId string) int {
 		return 580 * 1024
 	case "minimax-m2.5", "minimax-m2.1":
 		return 700 * 1024
-	case "claude-opus-4.5", "claude-sonnet-4.5", "claude-sonnet-4", "claude-haiku-4.5":
+	case "claude-opus-4.5", "claude-sonnet-4.5", "claude-haiku-4.5":
 		return 780 * 1024 // 200K-window Claude models
-	case "claude-opus-5", "claude-opus-5.5", "claude-sonnet-5", "claude-sonnet-5.5",
+	case "claude-opus-5", "claude-opus-5.5", "claude-sonnet-5", "claude-sonnet-5.5", "claude-haiku-5.5",
 		"claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-4.6", "claude-fable-5.1", "auto":
 		return 980 * 1024 // 1M-window Claude models
 	}
